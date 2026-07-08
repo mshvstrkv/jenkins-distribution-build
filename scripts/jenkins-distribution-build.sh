@@ -5,19 +5,23 @@ usage() {
   cat <<'EOF'
 Usage:
   JENKINS_USER=<user> JENKINS_TOKEN=<token> \
-  ./scripts/jenkins-distribution-build.sh \
+  scripts/jenkins-distribution-build.sh \
     --jenkins-url <url> \
     --project-name <name> \
-    --template-job <name> \
-    --branch <branch>
+    --branch <branch> \
+    [--template-job <name>] \
+    [--dry-run]
 
 Required arguments:
-  --jenkins-url    Jenkins base URL, for example https://jenkins.example.ru
+  --jenkins-url    Jenkins base URL or folder URL
   --project-name   Jenkins job name to find or create
-  --template-job   Existing Jenkins template job used when project job is missing
   --branch         Branch passed to buildWithParameters as BRANCH
 
-Required environment:
+Optional arguments:
+  --template-job   Existing Jenkins template job used when project job is missing
+  --dry-run        Print resolved inputs without contacting Jenkins
+
+Required environment unless --dry-run is used:
   JENKINS_USER
   JENKINS_TOKEN
 EOF
@@ -26,6 +30,11 @@ EOF
 die() {
   echo "Error: $*" >&2
   exit 1
+}
+
+blocked() {
+  echo "Blocked by environment or Jenkins permissions: $*" >&2
+  exit 2
 }
 
 require_value() {
@@ -48,10 +57,66 @@ urlencode() {
   done
 }
 
+json_field() {
+  local field="$1"
+  local json="$2"
+
+  if command -v python3 >/dev/null 2>&1; then
+    FIELD="$field" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except json.JSONDecodeError:
+    sys.exit(1)
+
+value = payload.get(os.environ["FIELD"], "")
+if value is None:
+    value = ""
+print(value)
+' <<<"$json"
+  elif command -v jq >/dev/null 2>&1; then
+    jq -r --arg field "$field" '.[$field] // ""' <<<"$json"
+  else
+    die "python3 or jq is required to parse Jenkins JSON"
+  fi
+}
+
+curl_capture() {
+  local output_file="$1"
+  local error_file="$2"
+  shift 2
+
+  if ! curl "$@" >"$output_file" 2>"$error_file"; then
+    local error
+    error="$(tr '\n' ' ' <"$error_file" | sed 's/[[:space:]]\+/ /g')"
+    [[ -n "$error" ]] || error="curl failed"
+    blocked "$error"
+  fi
+}
+
+curl_status() {
+  local error_file="$1"
+  shift
+
+  local status
+  if ! status="$(curl "$@" 2>"$error_file")"; then
+    local error
+    error="$(tr '\n' ' ' <"$error_file" | sed 's/[[:space:]]\+/ /g')"
+    [[ -n "$error" ]] || error="curl failed"
+    blocked "$error"
+  fi
+
+  printf '%s' "$status"
+}
+
 JENKINS_URL=""
 PROJECT_NAME=""
 TEMPLATE_JOB=""
 BRANCH=""
+DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,6 +140,10 @@ while [[ $# -gt 0 ]]; do
       BRANCH="$2"
       shift 2
       ;;
+    --dry-run)
+      DRY_RUN=true
+      shift
+      ;;
     --help|-h)
       usage
       exit 0
@@ -87,77 +156,129 @@ done
 
 [[ -n "$JENKINS_URL" ]] || die "Missing required argument: --jenkins-url"
 [[ -n "$PROJECT_NAME" ]] || die "Missing required argument: --project-name"
-[[ -n "$TEMPLATE_JOB" ]] || die "Missing required argument: --template-job"
 [[ -n "$BRANCH" ]] || die "Missing required argument: --branch"
-[[ -n "${JENKINS_USER:-}" ]] || die "Missing required environment variable: JENKINS_USER"
-[[ -n "${JENKINS_TOKEN:-}" ]] || die "Missing required environment variable: JENKINS_TOKEN"
 
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found"
-
-HEADERS_FILE="$(mktemp)"
-trap 'rm -f "$HEADERS_FILE"' EXIT
+if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then
+  die "python3 or jq is required to parse Jenkins JSON"
+fi
 
 JENKINS_URL="${JENKINS_URL%/}"
 PROJECT_NAME_ENCODED="$(urlencode "$PROJECT_NAME")"
-TEMPLATE_JOB_ENCODED="$(urlencode "$TEMPLATE_JOB")"
 JOB_URL="${JENKINS_URL}/job/${PROJECT_NAME_ENCODED}"
-TEMPLATE_JOB_URL="${JENKINS_URL}/job/${TEMPLATE_JOB_ENCODED}"
 
-CRUMB_JSON="$(curl --silent --show-error --fail \
+if [[ "$DRY_RUN" == "true" ]]; then
+  echo "Dry run"
+  echo "Project: ${PROJECT_NAME}"
+  echo "Branch: ${BRANCH}"
+  echo "Jenkins URL: ${JENKINS_URL}"
+  echo "Job name: ${PROJECT_NAME}"
+  echo "Job URL: ${JOB_URL}/"
+  if [[ -n "$TEMPLATE_JOB" ]]; then
+    echo "Template job: ${TEMPLATE_JOB}"
+  else
+    echo "Template job: not provided"
+  fi
+  echo "Status: Jenkins was not contacted"
+  exit 0
+fi
+
+[[ -n "${JENKINS_USER:-}" ]] || blocked "missing required environment variable JENKINS_USER"
+[[ -n "${JENKINS_TOKEN:-}" ]] || blocked "missing required environment variable JENKINS_TOKEN"
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+HEADERS_FILE="${TMP_DIR}/headers"
+BODY_FILE="${TMP_DIR}/body"
+ERROR_FILE="${TMP_DIR}/curl-error"
+CRUMB_HEADER=()
+
+CRUMB_STATUS="$(curl_status "$ERROR_FILE" \
+  --silent --show-error --output "$BODY_FILE" --write-out '%{http_code}' \
   --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-  "${JENKINS_URL}/crumbIssuer/api/json")" || die "Failed to obtain Jenkins crumb"
+  "${JENKINS_URL}/crumbIssuer/api/json")"
 
-CRUMB_FIELD="$(printf '%s' "$CRUMB_JSON" | sed -n 's/.*"crumbRequestField"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-CRUMB_VALUE="$(printf '%s' "$CRUMB_JSON" | sed -n 's/.*"crumb"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
-[[ -n "$CRUMB_FIELD" && -n "$CRUMB_VALUE" ]] || die "Failed to parse Jenkins crumb response"
-
-JOB_STATUS="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-  --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-  "${JOB_URL}/api/json")"
-
-case "$JOB_STATUS" in
+case "$CRUMB_STATUS" in
   200)
-    echo "Job exists"
+    CRUMB_JSON="$(cat "$BODY_FILE")"
+    CRUMB_FIELD="$(json_field "crumbRequestField" "$CRUMB_JSON")"
+    CRUMB_VALUE="$(json_field "crumb" "$CRUMB_JSON")"
+    [[ -n "$CRUMB_FIELD" && -n "$CRUMB_VALUE" ]] || blocked "failed to parse Jenkins crumb response"
+    CRUMB_HEADER=(--header "${CRUMB_FIELD}: ${CRUMB_VALUE}")
     ;;
   404)
-    TEMPLATE_CONFIG="$(curl --silent --show-error --fail \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "${TEMPLATE_JOB_URL}/config.xml")" || die "Failed to read template job config.xml"
-
-    curl --silent --show-error --fail --output /dev/null \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      --header "${CRUMB_FIELD}: ${CRUMB_VALUE}" \
-      --header "Content-Type: application/xml" \
-      --data-binary @- \
-      "${JENKINS_URL}/createItem?name=${PROJECT_NAME_ENCODED}" <<<"$TEMPLATE_CONFIG" || die "Failed to create Jenkins job"
-
-    echo "Created job"
+    CRUMB_HEADER=()
     ;;
   401|403)
-    die "Jenkins authentication failed or access is denied while checking job"
+    blocked "Jenkins returned HTTP ${CRUMB_STATUS} while obtaining crumb"
     ;;
   *)
-    die "Unexpected Jenkins response while checking job: HTTP ${JOB_STATUS}"
+    blocked "unexpected Jenkins response while obtaining crumb: HTTP ${CRUMB_STATUS}"
     ;;
 esac
 
-curl --silent --show-error --fail --output /dev/null --dump-header "$HEADERS_FILE" \
+JOB_STATUS="$(curl_status "$ERROR_FILE" \
+  --silent --show-error --output "$BODY_FILE" --write-out '%{http_code}' \
   --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-  --header "${CRUMB_FIELD}: ${CRUMB_VALUE}" \
+  "${JOB_URL}/api/json")"
+
+ACTION=""
+
+case "$JOB_STATUS" in
+  200)
+    ACTION="reused existing job"
+    echo "Job exists"
+    ;;
+  404)
+    [[ -n "$TEMPLATE_JOB" ]] || die "Jenkins job does not exist and --template-job was not provided"
+
+    TEMPLATE_JOB_ENCODED="$(urlencode "$TEMPLATE_JOB")"
+    TEMPLATE_JOB_URL="${JENKINS_URL}/job/${TEMPLATE_JOB_ENCODED}"
+    TEMPLATE_CONFIG="${TMP_DIR}/template-config.xml"
+
+    curl_capture "$TEMPLATE_CONFIG" "$ERROR_FILE" \
+      --silent --show-error --fail \
+      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+      "${TEMPLATE_JOB_URL}/config.xml"
+
+    curl_capture "$BODY_FILE" "$ERROR_FILE" \
+      --silent --show-error --fail --output "$BODY_FILE" \
+      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+      "${CRUMB_HEADER[@]}" \
+      --header "Content-Type: application/xml" \
+      --data-binary "@${TEMPLATE_CONFIG}" \
+      "${JENKINS_URL}/createItem?name=${PROJECT_NAME_ENCODED}"
+
+    ACTION="created new job"
+    echo "Created job"
+    ;;
+  401|403)
+    blocked "Jenkins returned HTTP ${JOB_STATUS} while checking job"
+    ;;
+  *)
+    blocked "unexpected Jenkins response while checking job: HTTP ${JOB_STATUS}"
+    ;;
+esac
+
+curl_capture "$BODY_FILE" "$ERROR_FILE" \
+  --silent --show-error --fail --output "$BODY_FILE" --dump-header "$HEADERS_FILE" \
+  --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+  "${CRUMB_HEADER[@]}" \
   --data-urlencode "BRANCH=${BRANCH}" \
-  "${JOB_URL}/buildWithParameters" || die "Failed to start Jenkins build"
+  "${JOB_URL}/buildWithParameters"
 
 QUEUE_URL="$(sed -n 's/^[Ll]ocation:[[:space:]]*\(.*\)[[:space:]]*$/\1/p' "$HEADERS_FILE" | tail -n 1 | tr -d '\r')"
 
-echo "Jenkins job URL: ${JOB_URL}/"
+echo "Project: ${PROJECT_NAME}"
+echo "Branch: ${BRANCH}"
+echo "Jenkins URL: ${JENKINS_URL}"
+echo "Job name: ${PROJECT_NAME}"
+echo "Action: ${ACTION}"
+echo "Job URL: ${JOB_URL}/"
 if [[ -n "$QUEUE_URL" ]]; then
   echo "Queue URL: ${QUEUE_URL}"
 else
   echo "Queue URL: not returned by Jenkins"
 fi
-cat <<EOF
-Next steps:
-  1. Open the Jenkins job URL.
-  2. Check the queue item or latest build status.
-  3. Use Jenkins logs for build diagnostics.
-EOF
+echo "Status: queued"
