@@ -7,135 +7,133 @@ description: Use when the user wants to find/create a Jenkins job by project nam
 
 ## Goal
 
-Run a Jenkins distributive build for the current project.
+Run Jenkins build for the current project using wrapper scripts.
 
-This skill supports exactly one workflow:
+The only supported Jenkins execution paths are:
 
-1. Resolve project name.
-2. Resolve branch.
-3. Run `scripts/jenkins-distribution-build.sh`.
-4. Report Jenkins job/build result.
+`scripts/jenkins-lookup.sh`
 
-Do not perform local builds.
+`scripts/jenkins-build.sh`
 
 ## Non-Goals
 
 This skill must not:
-
-- create Jenkinsfile;
-- generate Jenkins pipeline code;
-- run local Maven/Gradle/Docker;
-- inspect source code/tests/docs;
-- replace Jenkins operations with repository analysis;
-- search git history for Jenkins configuration;
-- produce long implementation plans.
+- call Jenkins API directly
+- generate curl commands
+- run Maven
+- run Gradle
+- run Docker
+- inspect distributive/pom.xml
+- inspect assembly/distributive.xml
+- read README
+- read AGENTS.md
+- search git history
+- search Jenkinsfile
+- create Jenkinsfile
 
 ## Execution Policy
 
-If the user asks to build through Jenkins:
+If user asks to build through Jenkins:
+1. Resolve Jenkins URL.
+2. Resolve project name.
+3. Resolve branch.
+4. Before running build, always run read-only lookup: `scripts/jenkins-lookup.sh`.
+5. If lookup returns `STATUS=OK` and `EXISTS=true`, then run `scripts/jenkins-build.sh`.
+6. If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` is present, then run `scripts/jenkins-build.sh` with `--template-job`.
+7. If lookup returns `STATUS=ERROR` and `ACTION=blocked`, stop immediately and report the exact `NEXT_REQUIRED_INPUT`.
 
-- execute the wrapper script;
-- do not produce a plan unless explicitly asked;
-- do not ask unnecessary questions if project name and branch are known;
-- Jenkins operation cannot be substituted with repository inspection.
+Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`, or lookup succeeded with `EXISTS=false` and template job was explicitly provided.
+If lookup returns `NEXT_REQUIRED_INPUT=template job`, stop and ask the user for the exact Jenkins job name or template job name.
+If the user provides exact Jenkins job name, pass it as `--job-name` to both lookup and build scripts.
+Do not produce a plan unless explicitly asked.
+Never inspect repository after lookup failure.
+Never search Jenkinsfile.
+Never create Jenkinsfile.
+Never suggest local Maven build.
+Never infer Jenkins job name from Jenkinsfile, Maven module, README, AGENTS.md, or git history.
 
 ## Script Execution Policy
 
-Use only:
+For read-only Jenkins checks, always use:
 
-`scripts/jenkins-distribution-build.sh`
+`scripts/jenkins-lookup.sh`
 
-Never construct custom curl commands directly.
-Never run local Maven/Gradle/Docker commands.
-Never create Jenkinsfile.
+For Jenkins actions that may change state or trigger work, always use:
 
-The wrapper script is responsible for:
+`scripts/jenkins-build.sh`
 
-- checking whether the Jenkins job exists;
-- creating a missing job from an approved template/example;
-- starting the build;
-- printing job URL, queue URL, or build URL when available.
+If either script is not found in the current repository, use the script with the same relative path from this skill directory.
 
-## Jenkins Access Failure Policy
+Never construct ad-hoc shell commands for Jenkins.
+Never construct curl commands.
+Never perform Jenkins API requests directly from the agent.
 
-If Jenkins access fails because:
+## Input Resolution
 
-- command is blocked by security policy;
-- network access is unavailable;
-- credentials are missing;
-- Jenkins returns 401/403;
-- script exits with permission/access error;
+Resolve project name from:
+1. current repository directory name
+2. root pom.xml artifactId
+3. user input
 
-then:
+Resolve branch from:
+1. user input
+2. current git branch
 
-- stop immediately;
-- report the exact reason;
-- do not inspect repository further;
-- do not inspect git history after Jenkins access fails;
-- do not search for Jenkinsfile;
-- do not create Jenkinsfile;
-- do not suggest local Maven build.
+Ask only for missing:
+- Jenkins URL
+- branch
+- exact Jenkins job name or template job, if lookup reports template job is required
+- credentials, if env vars are missing
 
-## Repository Inspection Policy
+## Validation
 
-Only inspect repository when project name cannot be determined.
+For safe real Jenkins validation, run lookup first:
 
-Allowed:
+```bash
+JENKINS_USER="<user>" JENKINS_TOKEN="<token>" \
+bash scripts/jenkins-lookup.sh \
+  --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
+  --project-name "ai-payments-merchant-registry"
+```
 
-- current directory name;
-- root `pom.xml` artifactId;
-- `.git/config` remote URL.
+Expected good result:
 
-Not allowed unless explicitly requested:
+```text
+STATUS=OK
+ACTION=lookup
+EXISTS=true
+JOB_NAME=...
+JOB_URL=...
+```
 
-- README;
-- AGENTS.md;
-- source code;
-- tests;
-- distributive module;
-- git history;
-- Jenkinsfile search.
+If lookup returns `STATUS=ERROR` and `NEXT_REQUIRED_INPUT=template job`, do not run build. Ask for the exact Jenkins job name and retry lookup with `--job-name`, or ask for a template job name.
 
-## Required Inputs
+## Stop Conditions
 
-Required:
+Stop immediately if a wrapper script reports:
+- missing Jenkins URL
+- missing credentials
+- Jenkins access denied
+- security policy block
+- template job required
+- Jenkins unavailable
 
-- Jenkins base URL;
-- branch;
-- project name.
-
-Infer project name from:
-
-1. current repository directory name;
-2. root `pom.xml` artifactId;
-3. user input.
-
-If branch is not provided:
-
-- use current git branch if available;
-- otherwise ask.
-
-If Jenkins URL is not provided:
-
-- ask.
-
-If job does not exist and template is required:
-
-- ask for template job name.
+After stopping:
+- do not inspect repository
+- do not search Jenkinsfile
+- do not create Jenkinsfile
+- do not suggest local Maven build
+- report exact `NEXT_REQUIRED_INPUT`
 
 ## Output Format
 
-Show:
-
-```text
-Project: <project name>
-Branch: <branch>
-Jenkins URL: <jenkins url>
-Job name: <job name>
-Action: reused existing job | created new job | blocked
-Queue URL / Build URL: <url or not returned>
-Status: <queued | blocked | failed>
-Next required input: <only if blocked>
-```
-
-Do not include long plans, local build output, Jenkinsfile suggestions, or repository analysis.
+Report:
+- Project
+- Branch
+- Jenkins URL
+- Job name
+- Action
+- Queue URL
+- Build URL
+- Result
+- Next required input, only if blocked
