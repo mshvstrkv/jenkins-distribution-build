@@ -1,19 +1,125 @@
 ---
 name: jenkins-distribution-build
-description: Use when the user wants to find/create a Jenkins job by project name and run a Jenkins distributive build.
+description: Use when the user wants to run a Jenkins build through the repository-provided wrapper scripts.
 ---
 
 # Jenkins Distribution Build Skill
 
 ## Goal
 
-Run Jenkins build for the current project using wrapper scripts.
+Run Jenkins lookup and build through wrapper scripts only.
 
-The only supported Jenkins execution paths are:
+The only supported execution paths are:
 
 `scripts/jenkins-lookup.sh`
 
 `scripts/jenkins-build.sh`
+
+## Wrapper First Policy
+
+The wrapper scripts are the only source of truth.
+
+Do not duplicate any logic implemented by the wrappers.
+
+Do not implement lookup yourself.
+
+Do not implement validation yourself.
+
+Do not infer Jenkins jobs yourself.
+
+Do not inspect the repository before executing the lookup wrapper.
+
+## Execution Policy
+
+If the user asks to build through Jenkins:
+1. Resolve wrapper location.
+2. Immediately execute `scripts/jenkins-lookup.sh`.
+3. Nothing else is allowed before this step.
+
+Do not create your own execution plan.
+
+Do not explain what you are going to do.
+
+Do not perform repository analysis.
+
+Execute wrappers directly.
+
+## Build Execution
+
+Only if lookup returns `STATUS=OK` and `EXISTS=true`, execute:
+
+`scripts/jenkins-build.sh`
+
+If lookup returns `EXISTS=false` and `NEXT_REQUIRED_INPUT=template job`, ask only for the exact template job.
+
+Nothing else.
+
+Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`, or lookup succeeded with `EXISTS=false` and template job was explicitly provided.
+
+If the user provides an exact Jenkins job name, pass it as `--job-name` to both lookup and build scripts.
+
+## Repository Inspection Restriction
+
+Repository inspection is forbidden before lookup succeeds.
+
+Do not read:
+- `pom.xml`
+- `README`
+- `AGENTS.md`
+- `Jenkinsfile`
+- `assembly/*`
+- `distributive/*`
+- `build.gradle`
+- `settings.gradle`
+
+unless the wrapper explicitly requests additional information.
+
+Never infer Jenkins job name from Jenkinsfile, Maven module, README, AGENTS.md, or git history.
+
+## Wrapper Owns Validation
+
+The wrapper validates:
+- credentials
+- Jenkins URL
+- project name
+- job existence
+- template requirement
+
+The skill must never validate these independently.
+
+## Script Execution Policy
+
+For read-only Jenkins checks, always use:
+
+`scripts/jenkins-lookup.sh`
+
+For Jenkins actions that may change state or trigger work, always use:
+
+`scripts/jenkins-build.sh`
+
+If either script is not found in the current repository, use the script with the same relative path from this skill directory.
+
+Never construct ad-hoc shell commands for Jenkins.
+
+Never construct curl commands.
+
+Never perform Jenkins API requests directly from the agent.
+
+## Stop Conditions
+
+If lookup returns `STATUS=ERROR`, stop immediately.
+
+Only report `NEXT_REQUIRED_INPUT`.
+
+Never attempt alternative strategies.
+
+Never inspect the repository.
+
+Never construct Jenkins URLs.
+
+Never search Jenkins.
+
+If a wrapper script reports any blocked state, stop immediately and report the exact `NEXT_REQUIRED_INPUT`.
 
 ## Non-Goals
 
@@ -30,104 +136,17 @@ This skill must not:
 - search git history
 - search Jenkinsfile
 - create Jenkinsfile
-
-## Execution Policy
-
-If user asks to build through Jenkins:
-1. Resolve Jenkins URL.
-2. Resolve project name.
-3. Resolve branch.
-4. Before running build, always run read-only lookup: `scripts/jenkins-lookup.sh`.
-5. If lookup returns `STATUS=OK` and `EXISTS=true`, then run `scripts/jenkins-build.sh`.
-6. If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` is present, then run `scripts/jenkins-build.sh` with `--template-job`.
-7. If lookup returns `STATUS=ERROR` and `ACTION=blocked`, stop immediately and report the exact `NEXT_REQUIRED_INPUT`.
-
-Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`, or lookup succeeded with `EXISTS=false` and template job was explicitly provided.
-If lookup returns `NEXT_REQUIRED_INPUT=template job`, stop and ask the user for the exact Jenkins job name or template job name.
-If the user provides exact Jenkins job name, pass it as `--job-name` to both lookup and build scripts.
-Do not produce a plan unless explicitly asked.
-Never inspect repository after lookup failure.
-Never search Jenkinsfile.
-Never create Jenkinsfile.
-Never suggest local Maven build.
-Never infer Jenkins job name from Jenkinsfile, Maven module, README, AGENTS.md, or git history.
-
-## Script Execution Policy
-
-For read-only Jenkins checks, always use:
-
-`scripts/jenkins-lookup.sh`
-
-For Jenkins actions that may change state or trigger work, always use:
-
-`scripts/jenkins-build.sh`
-
-If either script is not found in the current repository, use the script with the same relative path from this skill directory.
-
-Never construct ad-hoc shell commands for Jenkins.
-Never construct curl commands.
-Never perform Jenkins API requests directly from the agent.
-
-## Input Resolution
-
-Resolve project name from:
-1. current repository directory name
-2. root pom.xml artifactId
-3. user input
-
-Resolve branch from:
-1. user input
-2. current git branch
-
-Ask only for missing:
-- Jenkins URL
-- branch
-- exact Jenkins job name or template job, if lookup reports template job is required
-- credentials, if env vars are missing
-
-## Validation
-
-For safe real Jenkins validation, run lookup first:
-
-```bash
-JENKINS_USER="<user>" JENKINS_TOKEN="<token>" \
-bash scripts/jenkins-lookup.sh \
-  --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
-  --project-name "ai-payments-merchant-registry"
-```
-
-Expected good result:
-
-```text
-STATUS=OK
-ACTION=lookup
-EXISTS=true
-JOB_NAME=...
-JOB_URL=...
-```
-
-If lookup returns `STATUS=ERROR` and `NEXT_REQUIRED_INPUT=template job`, do not run build. Ask for the exact Jenkins job name and retry lookup with `--job-name`, or ask for a template job name.
-
-## Stop Conditions
-
-Stop immediately if a wrapper script reports:
-- missing Jenkins URL
-- missing credentials
-- Jenkins access denied
-- security policy block
-- template job required
-- Jenkins unavailable
-
-After stopping:
-- do not inspect repository
-- do not search Jenkinsfile
-- do not create Jenkinsfile
-- do not suggest local Maven build
-- report exact `NEXT_REQUIRED_INPUT`
+- inspect the project
+- understand the project
+- analyze build files
+- verify Maven
+- determine build type
+- determine modules
+- determine distributive structure
 
 ## Output Format
 
-Report:
+Report wrapper output fields only:
 - Project
 - Branch
 - Jenkins URL
@@ -137,3 +156,25 @@ Report:
 - Build URL
 - Result
 - Next required input, only if blocked
+
+## Hard Requirements
+
+The first executable action after resolving wrapper location MUST be:
+
+`scripts/jenkins-lookup.sh`
+
+No repository inspection is allowed before lookup.
+
+No shell commands except wrapper execution are allowed.
+
+No curl commands are allowed.
+
+No Jenkins API calls are allowed.
+
+No Maven commands are allowed.
+
+No Gradle commands are allowed.
+
+The wrappers are the authoritative implementation.
+
+The skill is only an orchestrator.
