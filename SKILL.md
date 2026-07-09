@@ -87,6 +87,33 @@ The agent may pass the same common arguments to both wrappers:
 
 `jenkins-lookup.sh` accepts `--branch` only for interface compatibility and ignores it.
 
+## Version Policy
+
+The agent must never calculate distributive versions itself.
+
+Version resolution belongs to `scripts/jenkins-build.sh`.
+
+When the user requests a test/IFT distributive:
+- pass `--distribution-type ift`
+
+When the user requests a release distributive:
+- pass `--distribution-type release`
+
+If the user provides an explicit version:
+- pass it as `--version`
+
+If the user does not provide a version:
+- do not ask for version
+- allow the wrapper to resolve it automatically
+
+IFT versions:
+- start from `IFT-0.0.1`
+- increment the last numeric segment
+
+Release versions:
+- start from `D-00.000.01`
+- increment the last numeric segment preserving padding
+
 ## Repository Inspection Restriction
 
 Repository inspection is forbidden before lookup succeeds.
@@ -193,6 +220,7 @@ This skill must not:
 - determine build type
 - determine modules
 - determine distributive structure
+- calculate distributive versions
 
 ## Output Format
 
@@ -205,6 +233,10 @@ Report wrapper output fields only:
 - Queue URL
 - Build URL
 - Result
+- Distribution type
+- Version
+- Version source
+- Previous version
 - Next required input, only if blocked
 
 ## Hard Requirements

@@ -11,6 +11,9 @@ Usage:
     --branch <branch> \
     [--job-name <job-name>] \
     [--template-job <job-name>] \
+    [--distribution-type <ift|release>] \
+    [--version <version>] \
+    [--version-source <auto|manual>] \
     [--dry-run] \
     [--wait] \
     [--timeout-seconds <number>]
@@ -23,6 +26,9 @@ Required arguments:
 Optional arguments:
   --job-name           Explicit Jenkins job name checked before generated candidates
   --template-job       Template job name, required when project job is missing
+  --distribution-type  Distributive type: ift or release
+  --version            Explicit distributive version
+  --version-source     Version source hint: auto or manual
   --dry-run            Print intended actions without changing Jenkins
   --wait               Wait until the queued build completes
   --timeout-seconds    Wait timeout, default 1800
@@ -42,6 +48,10 @@ emit_common() {
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
   echo "RESULT=${RESULT:-}"
+  echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE:-}"
+  echo "VERSION=${VERSION:-}"
+  echo "VERSION_SOURCE=${VERSION_SOURCE:-}"
+  echo "PREVIOUS_VERSION=${PREVIOUS_VERSION:-}"
   echo "NEXT_REQUIRED_INPUT=${NEXT_REQUIRED_INPUT:-}"
   echo "CHECKED_JOB_NAMES=${CHECKED_JOB_NAMES_CSV:-}"
 }
@@ -127,6 +137,178 @@ for artifact in payload.get("artifacts") or []:
     if path and base:
         print(urllib.parse.urljoin(base, "artifact/" + path))
 PY
+}
+
+version_from_builds_json() {
+  local distribution_type="$1"
+  local json_file="$2"
+
+  python3 - "$distribution_type" "$json_file" <<'PY'
+import json
+import re
+import sys
+
+distribution_type = sys.argv[1]
+json_file = sys.argv[2]
+
+if distribution_type == "ift":
+    pattern = re.compile(r"IFT-(\d+)\.(\d+)\.(\d+)")
+elif distribution_type == "release":
+    pattern = re.compile(r"D-(\d{2})\.(\d{3})\.(\d{2})(?!\d)")
+else:
+    print(f"ERROR: unsupported distribution type: {distribution_type}", file=sys.stderr)
+    sys.exit(2)
+
+try:
+    with open(json_file, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception as exc:
+    print(f"ERROR: failed to parse Jenkins builds JSON: {exc}", file=sys.stderr)
+    sys.exit(2)
+
+texts = []
+for build in payload.get("builds") or []:
+    for field in ("displayName", "description"):
+        value = build.get(field)
+        if value:
+            texts.append(str(value))
+    for action in build.get("actions") or []:
+        for param in action.get("parameters") or []:
+            if param.get("name") in {"VERSION", "DISTRIBUTIVE_VERSION", "DISTRIBUTION_VERSION"}:
+                value = param.get("value")
+                if value:
+                    texts.append(str(value))
+
+versions = []
+for text in texts:
+    for match in pattern.finditer(text):
+        version = match.group(0)
+        numeric = tuple(int(part) for part in match.groups())
+        versions.append((numeric, version))
+
+if not versions:
+    print("")
+    sys.exit(0)
+
+versions.sort(key=lambda item: item[0])
+print(versions[-1][1])
+PY
+}
+
+next_version() {
+  local distribution_type="$1"
+  local previous_version="$2"
+
+  python3 - "$distribution_type" "$previous_version" <<'PY'
+import re
+import sys
+
+distribution_type = sys.argv[1]
+previous_version = sys.argv[2]
+
+if distribution_type == "ift":
+    if not previous_version:
+        print("IFT-0.0.1")
+        sys.exit(0)
+    match = re.fullmatch(r"IFT-(\d+)\.(\d+)\.(\d+)", previous_version)
+    if not match:
+        print(f"invalid IFT version: {previous_version}", file=sys.stderr)
+        sys.exit(1)
+    major, minor, patch = (int(part) for part in match.groups())
+    print(f"IFT-{major}.{minor}.{patch + 1}")
+    sys.exit(0)
+
+if distribution_type == "release":
+    if not previous_version:
+        print("D-00.000.01")
+        sys.exit(0)
+    match = re.fullmatch(r"D-(\d{2})\.(\d{3})\.(\d{2})", previous_version)
+    if not match:
+        print(f"invalid release version: {previous_version}", file=sys.stderr)
+        sys.exit(1)
+    major, minor, patch = match.groups()
+    next_patch = int(patch) + 1
+    if next_patch > 99:
+        print(f"release version patch overflow: {previous_version}", file=sys.stderr)
+        sys.exit(3)
+    print(f"D-{major}.{minor}.{next_patch:02d}")
+    sys.exit(0)
+
+print(f"unsupported distribution type: {distribution_type}", file=sys.stderr)
+sys.exit(1)
+PY
+}
+
+validate_version_format() {
+  local distribution_type="$1"
+  local version="$2"
+
+  case "$distribution_type" in
+    ift)
+      [[ "$version" =~ ^IFT-[0-9]+\.[0-9]+\.[0-9]+$ ]] || error_exit "Invalid IFT version format: ${version}" "valid IFT version"
+      ;;
+    release)
+      [[ "$version" =~ ^D-[0-9]{2}\.[0-9]{3}\.[0-9]{2}$ ]] || error_exit "Invalid release version format: ${version}" "valid release version"
+      ;;
+    "")
+      ;;
+    *)
+      error_exit "Unsupported distribution type: ${distribution_type}" "distribution type"
+      ;;
+  esac
+}
+
+resolve_version() {
+  if [[ -n "$VERSION" ]]; then
+    validate_version_format "$DISTRIBUTION_TYPE" "$VERSION"
+    VERSION_SOURCE="manual"
+    return 0
+  fi
+
+  [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "--distribution-type is required when --version is not provided" "distribution type"
+  validate_version_format "$DISTRIBUTION_TYPE" "$(next_version "$DISTRIBUTION_TYPE" "")"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    PREVIOUS_VERSION=""
+    VERSION="$(next_version "$DISTRIBUTION_TYPE" "")"
+    VERSION_SOURCE="default"
+    return 0
+  fi
+
+  local status previous
+  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/api/json?tree=builds[number,url,result,displayName,description,actions[parameters[name,value]]]")"
+
+  case "$status" in
+    200)
+      previous="$(version_from_builds_json "$DISTRIBUTION_TYPE" "$BODY_FILE" 2>"$ERROR_FILE")" || {
+        local message
+        message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
+        error_exit "$message" "valid Jenkins builds JSON"
+      }
+      PREVIOUS_VERSION="$previous"
+      VERSION="$(next_version "$DISTRIBUTION_TYPE" "$PREVIOUS_VERSION" 2>"$ERROR_FILE")" || {
+        local message
+        message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
+        error_exit "$message" "valid previous version"
+      }
+      if [[ -n "$PREVIOUS_VERSION" ]]; then
+        VERSION_SOURCE="auto"
+      else
+        VERSION_SOURCE="default"
+      fi
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while resolving version: HTTP ${status}" "valid Jenkins credentials"
+      ;;
+    *)
+      warn "Could not read previous Jenkins builds for version resolution: HTTP ${status}; using initial version"
+      PREVIOUS_VERSION=""
+      VERSION="$(next_version "$DISTRIBUTION_TYPE" "")"
+      VERSION_SOURCE="default"
+      ;;
+  esac
 }
 
 curl_http() {
@@ -272,13 +454,17 @@ create_job_from_template() {
   ensure_crumb
 
   create_name_encoded="$(urlencode "$JOB_NAME")"
-  create_status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+  local curl_args=(
     --request POST \
     --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${CRUMB_HEADER[@]}" \
     --header "Content-Type: application/xml" \
-    --data-binary "@${TEMPLATE_CONFIG_FILE}" \
-    "${JENKINS_URL}/createItem?name=${create_name_encoded}")"
+    --data-binary "@${TEMPLATE_CONFIG_FILE}"
+  )
+  if ((${#CRUMB_HEADER[@]} > 0)); then
+    curl_args+=("${CRUMB_HEADER[@]}")
+  fi
+  curl_args+=("${JENKINS_URL}/createItem?name=${create_name_encoded}")
+  create_status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
 
   case "$create_status" in
     200|201|302)
@@ -307,18 +493,33 @@ trigger_build() {
 
   ensure_crumb
 
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+  local curl_args=(
     --request POST \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${CRUMB_HEADER[@]}" \
-    "${JOB_URL}/buildWithParameters?BRANCH=${encoded_branch}")"
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}"
+  )
+  if ((${#CRUMB_HEADER[@]} > 0)); then
+    curl_args+=("${CRUMB_HEADER[@]}")
+  fi
+  local build_url="${JOB_URL}/buildWithParameters?BRANCH=${encoded_branch}"
+  if [[ -n "$VERSION" ]]; then
+    build_url+="&VERSION=$(urlencode "$VERSION")"
+  fi
+  if [[ -n "$DISTRIBUTION_TYPE" ]]; then
+    build_url+="&DISTRIBUTION_TYPE=$(urlencode "$DISTRIBUTION_TYPE")"
+  fi
+  curl_args+=("$build_url")
+  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
 
   if [[ "$status" == "400" || "$status" == "404" || "$status" == "405" ]]; then
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    curl_args=(
       --request POST \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "${CRUMB_HEADER[@]}" \
-      "${JOB_URL}/build")"
+      --user "${JENKINS_USER}:${JENKINS_TOKEN}"
+    )
+    if ((${#CRUMB_HEADER[@]} > 0)); then
+      curl_args+=("${CRUMB_HEADER[@]}")
+    fi
+    curl_args+=("${JOB_URL}/build")
+    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
   fi
 
   case "$status" in
@@ -332,6 +533,58 @@ trigger_build() {
       error_exit "Unexpected Jenkins response while triggering build: HTTP ${status}" "Jenkins build access"
       ;;
   esac
+}
+
+run_version_self_tests() {
+  local tmp_dir json_file previous actual failed=0
+  tmp_dir="$(mktemp -d)"
+  json_file="${tmp_dir}/builds.json"
+
+  printf '{"builds":[]}\n' >"$json_file"
+  previous="$(version_from_builds_json ift "$json_file")"
+  actual="$(next_version ift "$previous")"
+  [[ "$actual" == "IFT-0.0.1" ]] || { echo "FAIL ift none: ${actual}"; failed=1; }
+
+  printf '{"builds":[{"actions":[{"parameters":[{"name":"VERSION","value":"IFT-0.0.1"}]}]}]}\n' >"$json_file"
+  previous="$(version_from_builds_json ift "$json_file")"
+  actual="$(next_version ift "$previous")"
+  [[ "$actual" == "IFT-0.0.2" ]] || { echo "FAIL ift patch: ${actual}"; failed=1; }
+
+  printf '{"builds":[{"displayName":"IFT-0.1.1"},{"description":"D-00.000.09"}]}\n' >"$json_file"
+  previous="$(version_from_builds_json ift "$json_file")"
+  actual="$(next_version ift "$previous")"
+  [[ "$actual" == "IFT-0.1.2" ]] || { echo "FAIL ift ignores release: ${actual}"; failed=1; }
+
+  printf '{"builds":[]}\n' >"$json_file"
+  previous="$(version_from_builds_json release "$json_file")"
+  actual="$(next_version release "$previous")"
+  [[ "$actual" == "D-00.000.01" ]] || { echo "FAIL release none: ${actual}"; failed=1; }
+
+  printf '{"builds":[{"actions":[{"parameters":[{"name":"DISTRIBUTIVE_VERSION","value":"D-00.000.01"}]}]}]}\n' >"$json_file"
+  previous="$(version_from_builds_json release "$json_file")"
+  actual="$(next_version release "$previous")"
+  [[ "$actual" == "D-00.000.02" ]] || { echo "FAIL release patch: ${actual}"; failed=1; }
+
+  printf '{"builds":[{"displayName":"D-00.000.09"},{"description":"IFT-0.9.9"}]}\n' >"$json_file"
+  previous="$(version_from_builds_json release "$json_file")"
+  actual="$(next_version release "$previous")"
+  [[ "$actual" == "D-00.000.10" ]] || { echo "FAIL release ignores ift: ${actual}"; failed=1; }
+
+  printf '{"builds":[{"displayName":"D-00.001.99"}]}\n' >"$json_file"
+  previous="$(version_from_builds_json release "$json_file")"
+  if actual="$(next_version release "$previous" 2>/dev/null)"; then
+    echo "FAIL release overflow: ${actual}"
+    failed=1
+  fi
+
+  if [[ "$failed" == "0" ]]; then
+    echo "VERSION_SELF_TESTS=OK"
+    rm -rf "$tmp_dir"
+  else
+    echo "VERSION_SELF_TESTS=FAIL"
+    rm -rf "$tmp_dir"
+    exit 1
+  fi
 }
 
 wait_for_build() {
@@ -406,6 +659,11 @@ PROJECT_NAME=""
 BRANCH=""
 TEMPLATE_JOB=""
 JOB_NAME_ARG=""
+DISTRIBUTION_TYPE=""
+VERSION=""
+VERSION_SOURCE=""
+VERSION_SOURCE_ARG=""
+PREVIOUS_VERSION=""
 DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
@@ -424,6 +682,10 @@ CRUMB_RESOLVED=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --self-test-versions)
+      run_version_self_tests
+      exit 0
+      ;;
     --jenkins-url)
       require_value "$1" "${2:-}"
       JENKINS_URL="$2"
@@ -447,6 +709,21 @@ while [[ $# -gt 0 ]]; do
     --template-job)
       require_value "$1" "${2:-}"
       TEMPLATE_JOB="$2"
+      shift 2
+      ;;
+    --distribution-type)
+      require_value "$1" "${2:-}"
+      DISTRIBUTION_TYPE="$2"
+      shift 2
+      ;;
+    --version)
+      require_value "$1" "${2:-}"
+      VERSION="$2"
+      shift 2
+      ;;
+    --version-source)
+      require_value "$1" "${2:-}"
+      VERSION_SOURCE_ARG="$2"
       shift 2
       ;;
     --dry-run)
@@ -476,6 +753,14 @@ done
 [[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
 [[ -n "$BRANCH" ]] || error_exit "Missing required argument: --branch" "branch"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
+case "$DISTRIBUTION_TYPE" in
+  ""|ift|release) ;;
+  *) error_exit "Unsupported distribution type: ${DISTRIBUTION_TYPE}" "distribution type" ;;
+esac
+case "$VERSION_SOURCE_ARG" in
+  ""|auto|manual) ;;
+  *) error_exit "Unsupported version source: ${VERSION_SOURCE_ARG}" "version source" ;;
+esac
 [[ -n "${JENKINS_USER:-}" ]] || error_exit "Missing required environment variable: JENKINS_USER" "JENKINS_USER"
 [[ -n "${JENKINS_TOKEN:-}" ]] || error_exit "Missing required environment variable: JENKINS_TOKEN" "JENKINS_TOKEN"
 command -v curl >/dev/null 2>&1 || error_exit "curl is required but was not found" "curl"
@@ -494,11 +779,13 @@ if [[ "$DRY_RUN" == "true" ]]; then
   build_candidate_job_names
   JOB_NAME="${JOB_NAME_ARG:-$PROJECT_NAME}"
   JOB_URL="$(job_url_for "$JOB_NAME")"
+  resolve_version
   ACTION="dry-run"
 else
   if ! find_existing_job; then
     create_job_from_template
   fi
+  resolve_version
   trigger_build
   wait_for_build
 fi
