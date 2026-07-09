@@ -58,6 +58,17 @@ Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`
 
 If the user provides an exact Jenkins job name, pass it as `--job-name` to both lookup and build scripts.
 
+## Unified Wrapper Interface
+
+The agent may pass the same common arguments to both wrappers:
+- `--jenkins-url`
+- `--project-name`
+- `--branch`
+- `--job-name`
+- `--template-job`
+
+`jenkins-lookup.sh` accepts `--branch` only for interface compatibility and ignores it.
+
 ## Repository Inspection Restriction
 
 Repository inspection is forbidden before lookup succeeds.
@@ -86,6 +97,10 @@ The wrapper validates:
 - template requirement
 
 The skill must never validate these independently.
+
+The wrapper output is authoritative.
+
+Never inspect wrapper implementation to understand or fix wrapper errors during a build request.
 
 ## Script Execution Policy
 
@@ -120,6 +135,23 @@ Never construct Jenkins URLs.
 Never search Jenkins.
 
 If a wrapper script reports any blocked state, stop immediately and report the exact `NEXT_REQUIRED_INPUT`.
+
+## Wrapper Error Policy
+
+If any wrapper returns `STATUS=ERROR`:
+- stop immediately
+- report `REASON`
+- report `NEXT_REQUIRED_INPUT`
+- do not read wrapper source
+- do not inspect wrapper usage
+- do not retry with different arguments
+- do not infer wrapper arguments
+- do not check env manually
+- do not run `echo JENKINS_USER`
+- do not run `echo JENKINS_TOKEN`
+- do not inspect repository
+- do not switch to curl
+- do not suggest Maven, Gradle, Docker, or local build
 
 ## Non-Goals
 

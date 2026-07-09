@@ -8,6 +8,7 @@ Usage:
   bash scripts/jenkins-lookup.sh \
     --jenkins-url <url> \
     --project-name <name> \
+    [--branch <branch>] \
     [--job-name <job-name>] \
     [--template-job <job-name>]
 
@@ -16,6 +17,7 @@ Required arguments:
   --project-name    Project name used to find Jenkins job
 
 Optional arguments:
+  --branch         Optional. Accepted for interface compatibility with jenkins-build.sh. Ignored by lookup.
   --job-name        Explicit Jenkins job name checked before generated candidates
   --template-job    Template job name available for later creation
 
@@ -27,6 +29,7 @@ EOF
 
 emit_common() {
   echo "PROJECT_NAME=${PROJECT_NAME:-}"
+  echo "BRANCH=${BRANCH:-}"
   echo "JOB_NAME=${JOB_NAME:-}"
   echo "JOB_URL=${JOB_URL:-}"
   echo "JENKINS_URL=${JENKINS_URL:-}"
@@ -123,6 +126,7 @@ curl_get_status() {
 
 JENKINS_URL=""
 PROJECT_NAME=""
+BRANCH=""
 TEMPLATE_JOB=""
 JOB_NAME_ARG=""
 JOB_NAME=""
@@ -143,6 +147,11 @@ while [[ $# -gt 0 ]]; do
     --project-name)
       require_value "$1" "${2:-}"
       PROJECT_NAME="$2"
+      shift 2
+      ;;
+    --branch)
+      require_value "$1" "${2:-}"
+      BRANCH="$2"
       shift 2
       ;;
     --job-name)
