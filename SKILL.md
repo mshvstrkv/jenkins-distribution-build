@@ -33,8 +33,10 @@ Do not inspect the repository before executing the lookup wrapper.
 
 If the user asks to build through Jenkins:
 1. Resolve wrapper location.
-2. Immediately execute `scripts/jenkins-lookup.sh`.
-3. Nothing else is allowed before this step.
+2. Run `scripts/jenkins-lookup.sh`.
+3. If lookup returns `STATUS=OK` and `EXISTS=true`, immediately run `scripts/jenkins-build.sh`.
+4. If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` exists, run `scripts/jenkins-build.sh --template-job ...`.
+5. If lookup returns `STATUS=ERROR`, stop immediately and report only `REASON` and `NEXT_REQUIRED_INPUT`.
 
 Do not create your own execution plan.
 
@@ -44,15 +46,31 @@ Do not perform repository analysis.
 
 Execute wrappers directly.
 
+Use lookup only as an internal prerequisite.
+
+Do not summarize lookup before running build.
+
+Do not ask "Ready to proceed?"
+
+Do not ask "Would you like me to continue?"
+
+Do not wait for confirmation between lookup and build.
+
+The original user request to run a Jenkins build is the confirmation.
+
 ## Build Execution
 
-Only if lookup returns `STATUS=OK` and `EXISTS=true`, execute:
+Only if lookup returns `STATUS=OK` and `EXISTS=true`, immediately execute:
 
 `scripts/jenkins-build.sh`
 
-If lookup returns `EXISTS=false` and `NEXT_REQUIRED_INPUT=template job`, ask only for the exact template job.
+If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` exists, immediately execute:
 
-Nothing else.
+`scripts/jenkins-build.sh --template-job ...`
+
+Only stop after lookup if `STATUS=ERROR` or `NEXT_REQUIRED_INPUT` is not empty.
+
+If lookup returns `EXISTS=false` and `NEXT_REQUIRED_INPUT=template job`, ask only for the exact template job.
 
 Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`, or lookup succeeded with `EXISTS=false` and template job was explicitly provided.
 
