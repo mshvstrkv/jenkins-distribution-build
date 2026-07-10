@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${SKILL_ROOT}/.env"
+
+load_skill_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local perms
+  perms="$(stat -f "%Lp" "$ENV_FILE" 2>/dev/null || stat -c "%a" "$ENV_FILE" 2>/dev/null || true)"
+  if [[ -n "$perms" && "$perms" != "600" ]]; then
+    echo "WARNING=.env should have permissions 600"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -n "${!key:-}" ]] || export "$key=$value"
+  done <"$ENV_FILE"
+}
+
+load_skill_env
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -14,6 +38,9 @@ Usage:
     [--distribution-type <ift|release>] \
     [--version <version>] \
     [--version-source <auto|manual>] \
+    [--jenkins-branch-param <name>] \
+    [--jenkins-version-param <name>] \
+    [--jenkins-distribution-type-param <name>] \
     [--dry-run] \
     [--wait] \
     [--timeout-seconds <number>]
@@ -26,9 +53,12 @@ Required arguments:
 Optional arguments:
   --job-name           Explicit Jenkins job name checked before generated candidates
   --template-job       Template job name, required when project job is missing
-  --distribution-type  Distributive type: ift or release
+  --distribution-type  Distributive type: ift|release, aliases: test/testing/prod/production
   --version            Explicit distributive version
   --version-source     Version source hint: auto or manual
+  --jenkins-branch-param             Jenkins branch parameter name, default BRANCH
+  --jenkins-version-param            Jenkins version parameter name, default VERSION
+  --jenkins-distribution-type-param  Jenkins distribution type parameter name, default DISTRIBUTION_TYPE
   --dry-run            Print intended actions without changing Jenkins
   --wait               Wait until the queued build completes
   --timeout-seconds    Wait timeout, default 1800
@@ -54,6 +84,10 @@ emit_common() {
   echo "PREVIOUS_VERSION=${PREVIOUS_VERSION:-}"
   echo "NEXT_REQUIRED_INPUT=${NEXT_REQUIRED_INPUT:-}"
   echo "CHECKED_JOB_NAMES=${CHECKED_JOB_NAMES_CSV:-}"
+  echo "JENKINS_PARAMETER_BRANCH=${JENKINS_BRANCH_PARAM:-}"
+  echo "JENKINS_PARAMETER_VERSION=${JENKINS_VERSION_PARAM:-}"
+  echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_DISTRIBUTION_TYPE_PARAM:-}"
+  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
 }
 
 error_exit() {
@@ -68,8 +102,63 @@ error_exit() {
   exit 1
 }
 
+sanitize_technical_reason() {
+  sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
+}
+
+is_corporate_network_error() {
+  case "$1" in
+    *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+corporate_environment_required_exit() {
+  echo "STATUS=ERROR"
+  echo "STATE=corporate_environment_required"
+  echo "REASON=This operation requires corporate network access"
+  NEXT_REQUIRED_INPUT="run inside corporate network"
+  emit_common
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+corporate_network_unavailable_exit() {
+  local technical_reason="$1"
+  technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
+  echo "STATUS=ERROR"
+  echo "STATE=corporate_network_unavailable"
+  echo "REASON=Corporate service is unreachable from the current environment"
+  NEXT_REQUIRED_INPUT="run inside corporate network"
+  emit_common
+  echo "MUTATIONS_PERFORMED=false"
+  [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
+  exit 1
+}
+
 warn() {
   echo "WARNING=$*"
+}
+
+normalize_distribution_type() {
+  local value="$1"
+
+  case "$value" in
+    "")
+      printf ''
+      ;;
+    ift|test|testing)
+      printf 'ift'
+      ;;
+    release|prod|production)
+      printf 'release'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 require_value() {
@@ -258,6 +347,13 @@ validate_version_format() {
   esac
 }
 
+emit_version_resolution() {
+  echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE:-}"
+  echo "PREVIOUS_VERSION=${PREVIOUS_VERSION:-}"
+  echo "VERSION=${VERSION:-}"
+  echo "VERSION_SOURCE=${VERSION_SOURCE:-}"
+}
+
 resolve_version() {
   if [[ -n "$VERSION" ]]; then
     validate_version_format "$DISTRIBUTION_TYPE" "$VERSION"
@@ -318,6 +414,11 @@ curl_http() {
 
   local status
   if ! status="$(curl --silent --show-error --output "$body_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@" 2>"$ERROR_FILE")"; then
+    local message
+    message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
+    if is_corporate_network_error "$message"; then
+      corporate_network_unavailable_exit "$message"
+    fi
     status="000"
   fi
 
@@ -332,6 +433,9 @@ curl_download() {
     local message
     message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
     [[ -n "$message" ]] || message="curl failed"
+    if is_corporate_network_error "$message"; then
+      corporate_network_unavailable_exit "$message"
+    fi
     error_exit "${message}" "Jenkins access"
   fi
 }
@@ -488,8 +592,11 @@ trigger_build() {
     return 0
   fi
 
-  local status encoded_branch
+  local status encoded_branch encoded_branch_param encoded_version_param encoded_distribution_type_param
   encoded_branch="$(urlencode "$BRANCH")"
+  encoded_branch_param="$(urlencode "$JENKINS_BRANCH_PARAM")"
+  encoded_version_param="$(urlencode "$JENKINS_VERSION_PARAM")"
+  encoded_distribution_type_param="$(urlencode "$JENKINS_DISTRIBUTION_TYPE_PARAM")"
 
   ensure_crumb
 
@@ -500,17 +607,20 @@ trigger_build() {
   if ((${#CRUMB_HEADER[@]} > 0)); then
     curl_args+=("${CRUMB_HEADER[@]}")
   fi
-  local build_url="${JOB_URL}/buildWithParameters?BRANCH=${encoded_branch}"
+  local build_url="${JOB_URL}/buildWithParameters?${encoded_branch_param}=${encoded_branch}"
   if [[ -n "$VERSION" ]]; then
-    build_url+="&VERSION=$(urlencode "$VERSION")"
+    build_url+="&${encoded_version_param}=$(urlencode "$VERSION")"
   fi
   if [[ -n "$DISTRIBUTION_TYPE" ]]; then
-    build_url+="&DISTRIBUTION_TYPE=$(urlencode "$DISTRIBUTION_TYPE")"
+    build_url+="&${encoded_distribution_type_param}=$(urlencode "$DISTRIBUTION_TYPE")"
   fi
   curl_args+=("$build_url")
   status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
 
   if [[ "$status" == "400" || "$status" == "404" || "$status" == "405" ]]; then
+    if [[ -n "$VERSION" || -n "$DISTRIBUTION_TYPE" ]]; then
+      error_exit "Parameterized Jenkins build failed: HTTP ${status}" "Jenkins parameter mapping"
+    fi
     curl_args=(
       --request POST \
       --user "${JENKINS_USER}:${JENKINS_TOKEN}"
@@ -578,6 +688,13 @@ run_version_self_tests() {
   fi
 
   if [[ "$failed" == "0" ]]; then
+    [[ "$(normalize_distribution_type test)" == "ift" ]] || { echo "FAIL alias test"; failed=1; }
+    [[ "$(normalize_distribution_type testing)" == "ift" ]] || { echo "FAIL alias testing"; failed=1; }
+    [[ "$(normalize_distribution_type prod)" == "release" ]] || { echo "FAIL alias prod"; failed=1; }
+    [[ "$(normalize_distribution_type production)" == "release" ]] || { echo "FAIL alias production"; failed=1; }
+  fi
+
+  if [[ "$failed" == "0" ]]; then
     echo "VERSION_SELF_TESTS=OK"
     rm -rf "$tmp_dir"
   else
@@ -620,7 +737,7 @@ wait_for_build() {
         ;;
     esac
 
-    sleep 5
+    sleep 10
   done
 
   while true; do
@@ -664,9 +781,14 @@ VERSION=""
 VERSION_SOURCE=""
 VERSION_SOURCE_ARG=""
 PREVIOUS_VERSION=""
+JENKINS_BRANCH_PARAM="BRANCH"
+JENKINS_VERSION_PARAM="VERSION"
+JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
+RESOLVE_VERSION_ONLY=false
 DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
+EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 ACTION=""
 JOB_NAME=""
 JOB_URL=""
@@ -685,6 +807,10 @@ while [[ $# -gt 0 ]]; do
     --self-test-versions)
       run_version_self_tests
       exit 0
+      ;;
+    --resolve-version-only)
+      RESOLVE_VERSION_ONLY=true
+      shift
       ;;
     --jenkins-url)
       require_value "$1" "${2:-}"
@@ -726,6 +852,21 @@ while [[ $# -gt 0 ]]; do
       VERSION_SOURCE_ARG="$2"
       shift 2
       ;;
+    --jenkins-branch-param)
+      require_value "$1" "${2:-}"
+      JENKINS_BRANCH_PARAM="$2"
+      shift 2
+      ;;
+    --jenkins-version-param)
+      require_value "$1" "${2:-}"
+      JENKINS_VERSION_PARAM="$2"
+      shift 2
+      ;;
+    --jenkins-distribution-type-param)
+      require_value "$1" "${2:-}"
+      JENKINS_DISTRIBUTION_TYPE_PARAM="$2"
+      shift 2
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -737,6 +878,11 @@ while [[ $# -gt 0 ]]; do
     --timeout-seconds)
       require_value "$1" "${2:-}"
       TIMEOUT_SECONDS="$2"
+      shift 2
+      ;;
+    --execution-environment)
+      require_value "$1" "${2:-}"
+      EXECUTION_ENVIRONMENT="$2"
       shift 2
       ;;
     --help|-h)
@@ -752,11 +898,15 @@ done
 [[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
 [[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
 [[ -n "$BRANCH" ]] || error_exit "Missing required argument: --branch" "branch"
-[[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
-case "$DISTRIBUTION_TYPE" in
-  ""|ift|release) ;;
-  *) error_exit "Unsupported distribution type: ${DISTRIBUTION_TYPE}" "distribution type" ;;
+case "$EXECUTION_ENVIRONMENT" in
+  local|corporate) ;;
+  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
 esac
+[[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
+raw_distribution_type="$DISTRIBUTION_TYPE"
+if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$raw_distribution_type")"; then
+  error_exit "Unsupported distribution type: ${raw_distribution_type}" "distribution type"
+fi
 case "$VERSION_SOURCE_ARG" in
   ""|auto|manual) ;;
   *) error_exit "Unsupported version source: ${VERSION_SOURCE_ARG}" "version source" ;;
@@ -782,10 +932,23 @@ if [[ "$DRY_RUN" == "true" ]]; then
   resolve_version
   ACTION="dry-run"
 else
+  if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
+    corporate_environment_required_exit
+  fi
   if ! find_existing_job; then
+    if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
+      error_exit "Jenkins job not found. Checked: ${CHECKED_JOB_NAMES[*]}." "existing Jenkins job"
+    fi
     create_job_from_template
   fi
   resolve_version
+  emit_version_resolution
+  if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
+    echo "STATUS=OK"
+    echo "ACTION=version"
+    emit_common
+    exit 0
+  fi
   trigger_build
   wait_for_build
 fi

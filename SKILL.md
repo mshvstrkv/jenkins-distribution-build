@@ -1,185 +1,304 @@
 ---
 name: jenkins-distribution-build
-description: Use when the user wants to run a Jenkins build through the repository-provided wrapper scripts.
+description: Use when the user wants to build a distributive through Jenkins and optionally deliver it to a test or release environment through GitOps and Argo CD wrappers.
 ---
 
 # Jenkins Distribution Build Skill
 
 ## Goal
 
-Run Jenkins lookup and build through wrapper scripts only.
+Run the full managed distributive workflow only through wrapper scripts.
 
-The only supported execution paths are:
+For a full user request such as "build a test distributive and deploy it to the test stand", the only supported entrypoint is:
 
-`scripts/jenkins-lookup.sh`
+`scripts/distribution-delivery.sh`
 
-`scripts/jenkins-build.sh`
+For a safe end-to-end validation without external mutations, pass:
 
-## Wrapper First Policy
+`--preflight`
 
-The wrapper scripts are the only source of truth.
+The wrapper scripts are the source of truth for lookup, build, versioning, failure analysis, GitOps configuration, Argo CD operations, and deployment state decisions.
 
-Do not duplicate any logic implemented by the wrappers.
+Configuration and credentials are loaded by wrappers from the skill root `.env` file when present. The skill must not read or print `.env`.
 
-Do not implement lookup yourself.
+## Full Workflow
 
-Do not implement validation yourself.
+`scripts/distribution-delivery.sh` owns this workflow:
 
-Do not infer Jenkins jobs yourself.
+Jenkins lookup
+-> distribution type normalization
+-> version resolution
+-> Jenkins build with `--wait`
+-> Jenkins result handling
+-> failure analysis when build result is not `SUCCESS`
+-> deployment lookup
+-> GitOps configuration create/update
+-> Argo CD application create/update
+-> Argo CD sync and health wait
+-> final machine-readable output
 
-Do not inspect the repository before executing the lookup wrapper.
+The skill must not perform any workflow step directly.
 
-## Execution Policy
+## Distribution Type Policy
 
-If the user asks to build through Jenkins:
-1. Resolve wrapper location.
-2. Run `scripts/jenkins-lookup.sh`.
-3. If lookup returns `STATUS=OK` and `EXISTS=true`, immediately run `scripts/jenkins-build.sh`.
-4. If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` exists, run `scripts/jenkins-build.sh --template-job ...`.
-5. If lookup returns `STATUS=ERROR`, stop immediately and report only `REASON` and `NEXT_REQUIRED_INPUT`.
+Canonical distribution types:
+- `ift` for test distributives
+- `release` for release distributives
 
-Do not create your own execution plan.
+Aliases are normalized by wrappers:
+- `test` -> `ift`
+- `testing` -> `ift`
+- `ift` -> `ift`
+- `release` -> `release`
+- `prod` -> `release`
+- `production` -> `release`
 
-Do not explain what you are going to do.
+If the user asks for a test distributive, pass:
 
-Do not perform repository analysis.
+`--distribution-type ift`
 
-Execute wrappers directly.
+If the user asks for a release distributive, pass:
 
-Use lookup only as an internal prerequisite.
+`--distribution-type release`
 
-Do not summarize lookup before running build.
+If the user asks only to build a distributive and the type cannot be determined from the current request, ask for exactly one value:
 
-Do not ask "Ready to proceed?"
+`ift` or `release`
 
-Do not ask "Would you like me to continue?"
+Do not offer arbitrary distribution type values.
 
-Do not wait for confirmation between lookup and build.
-
-The original user request to run a Jenkins build is the confirmation.
-
-## Build Execution
-
-Only if lookup returns `STATUS=OK` and `EXISTS=true`, immediately execute:
-
-`scripts/jenkins-build.sh`
-
-If lookup returns `STATUS=OK`, `EXISTS=false`, and `TEMPLATE_JOB` exists, immediately execute:
-
-`scripts/jenkins-build.sh --template-job ...`
-
-Only stop after lookup if `STATUS=ERROR` or `NEXT_REQUIRED_INPUT` is not empty.
-
-If lookup returns `EXISTS=false` and `NEXT_REQUIRED_INPUT=template job`, ask only for the exact template job.
-
-Do not run `scripts/jenkins-build.sh` unless lookup succeeded with `EXISTS=true`, or lookup succeeded with `EXISTS=false` and template job was explicitly provided.
-
-If the user provides an exact Jenkins job name, pass it as `--job-name` to both lookup and build scripts.
-
-## Unified Wrapper Interface
-
-The agent may pass the same common arguments to both wrappers:
-- `--jenkins-url`
-- `--project-name`
-- `--branch`
-- `--job-name`
-- `--template-job`
-
-`jenkins-lookup.sh` accepts `--branch` only for interface compatibility and ignores it.
+Do not use `snapshot`.
 
 ## Version Policy
 
-The agent must never calculate distributive versions itself.
+The agent must never calculate distributive versions.
 
-Version resolution belongs to `scripts/jenkins-build.sh`.
+Version resolution belongs to `scripts/jenkins-build.sh`, normally invoked by `scripts/distribution-delivery.sh`.
 
-When the user requests a test/IFT distributive:
-- pass `--distribution-type ift`
+If the user provides an explicit version, pass it as:
 
-When the user requests a release distributive:
-- pass `--distribution-type release`
+`--version <version>`
 
-If the user provides an explicit version:
-- pass it as `--version`
-
-If the user does not provide a version:
-- do not ask for version
-- allow the wrapper to resolve it automatically
+If the user does not provide a version, do not ask for it. Allow the wrapper to resolve it automatically.
 
 IFT versions:
+- format: `IFT-X.Y.Z`
 - start from `IFT-0.0.1`
-- increment the last numeric segment
+- increment only the last numeric segment
+- ignore release versions
 
 Release versions:
+- format: `D-XX.YYY.ZZ`
 - start from `D-00.000.01`
-- increment the last numeric segment preserving padding
+- increment only the last numeric segment preserving padding
+- ignore IFT versions
 
-## Repository Inspection Restriction
+## Execution Policy
 
-Repository inspection is forbidden before lookup succeeds.
+For full delivery requests, execute `scripts/distribution-delivery.sh` directly.
 
-Do not read:
-- `pom.xml`
-- `README`
-- `AGENTS.md`
-- `Jenkinsfile`
-- `assembly/*`
-- `distributive/*`
-- `build.gradle`
-- `settings.gradle`
+For preflight requests, execute `scripts/distribution-delivery.sh --preflight` directly.
 
-unless the wrapper explicitly requests additional information.
+Real preflight, Jenkins build, GitOps, and Argo CD operations require:
 
-Never infer Jenkins job name from Jenkinsfile, Maven module, README, AGENTS.md, or git history.
+`--execution-environment corporate`
 
-## Wrapper Owns Validation
+Outside the corporate network, run only local validation commands.
 
-The wrapper validates:
-- credentials
-- Jenkins URL
-- project name
-- job existence
-- template requirement
+For "build distributive" requests, include `--wait`.
 
-The skill must never validate these independently.
+Do not stop after Jenkins queueing. The wrapper must wait for the final Jenkins result.
 
-The wrapper output is authoritative.
+Do not ask for confirmation before Jenkins build. The user request to build is confirmation.
 
-Never inspect wrapper implementation to understand or fix wrapper errors during a build request.
+Do not call `scripts/jenkins-lookup.sh`, `scripts/jenkins-build.sh`, `scripts/deployment-lookup.sh`, `scripts/argocd-deploy.sh`, or `scripts/jenkins-analyze-failure.sh` directly for the full workflow unless the user explicitly requests that lower-level wrapper.
 
-## Script Execution Policy
+Do not create your own execution plan.
 
-For read-only Jenkins checks, always use:
+Do not explain what you are going to do before wrapper execution.
 
-`scripts/jenkins-lookup.sh`
+Execute wrappers directly.
 
-For Jenkins actions that may change state or trigger work, always use:
+## Corporate Environment Policy
 
-`scripts/jenkins-build.sh`
+This skill is designed to run inside the corporate network.
 
-If either script is not found in the current repository, use the script with the same relative path from this skill directory.
+Real Jenkins, Bitbucket, Argo CD, and Kubernetes operations must only be executed from an environment with corporate network access.
 
-Never construct ad-hoc shell commands for Jenkins.
+Outside the corporate environment, run only:
+- syntax checks
+- self-tests
+- fixture tests
+- dry-run
+- local template rendering validation
 
-Never construct curl commands.
+Do not treat DNS, TLS, proxy, VPN, or network failures outside the corporate environment as wrapper implementation defects.
 
-Never perform Jenkins API requests directly from the agent.
+If corporate services are unreachable:
+- stop immediately
+- report that corporate network access is required
+- do not diagnose VPN, proxy, certificates, or hostnames
+- do not modify wrappers
+- do not retry with insecure options
 
-## Stop Conditions
+Do not:
+- change Jenkins URL
+- change proxy settings
+- change `NO_PROXY`
+- disable TLS verification
+- use `curl -k`
+- import certificates
+- change trust stores
+- search for corporate access workarounds
 
-If lookup returns `STATUS=ERROR`, stop immediately.
+Never automatically infer `corporate` mode from DNS, TLS, or host reachability.
 
-Only report `NEXT_REQUIRED_INPUT`.
+## Validation Policy
 
-Never attempt alternative strategies.
+Local validation is the default.
 
-Never inspect the repository.
+Local validation uses:
 
-Never construct Jenkins URLs.
+`scripts/distribution-delivery.sh --self-test`
 
-Never search Jenkins.
+It checks only:
+- syntax
+- version logic
+- aliases
+- template rendering
+- path safety
+- deployment-state fixtures
+- parameter mapping fixtures
 
-If a wrapper script reports any blocked state, stop immediately and report the exact `NEXT_REQUIRED_INPUT`.
+Local validation must not access:
+- Jenkins
+- corporate Bitbucket
+- Argo CD
+- Kubernetes
+
+Corporate preflight uses:
+
+`scripts/distribution-delivery.sh --preflight --execution-environment corporate`
+
+Corporate preflight is only for environments inside the corporate network and checks:
+- Jenkins
+- Bitbucket through Git SSH
+- Argo CD
+- deployment state
+
+If wrappers return `STATE=corporate_environment_required` or `STATE=corporate_network_unavailable`, stop immediately and report:
+- `REASON`
+- `NEXT_REQUIRED_INPUT`
+
+Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, proxy inspection, certificate inspection, or hostname substitution.
+
+## Failure Policy
+
+If Jenkins result is `FAILURE`, `UNSTABLE`, or `ABORTED`, the orchestrator runs:
+
+`scripts/jenkins-analyze-failure.sh`
+
+The skill must report wrapper output:
+- `FAILURE_CATEGORY`
+- `FAILURE_SUMMARY`
+- `LOG_FILE`
+- `SUGGESTED_ACTION`
+
+The skill must not:
+- read Jenkins console log directly
+- analyze build errors itself
+- edit project files automatically
+- commit changes
+- rerun Jenkins automatically
+
+Wait for a separate user request before changing source code or rerunning a build after failure.
+
+## Deployment Policy
+
+First deployment is decided only by wrapper output:
+
+`FIRST_DEPLOYMENT=true`
+
+only when:
+- GitOps config path does not exist
+- Argo CD Application does not exist
+
+If one exists and the other does not, wrappers return inconsistent state and the skill must stop.
+
+The skill must not edit GitOps configuration directly.
+
+The skill must not call Argo CD directly.
+
+GitOps uses standard Git over SSH.
+
+Do not ask for Bitbucket login/token when the repository URL uses SSH. SSH agent, SSH key, or standard Git credential mechanisms must be used by Git.
+
+Operations that change GitOps repository or Argo CD must follow the environment approval policy implemented by wrappers.
+
+The wrapper requires `--config-template-path` for approved first-deployment configuration creation. The skill must pass only the user-provided approved template path and must not generate Kubernetes or Argo CD YAML.
+
+Project-specific values are rendered by wrappers from `PROJECT_NAME`.
+
+The skill must not manually construct:
+- config path
+- charts path
+- config template path
+- Argo CD application name
+
+For an existing Argo CD Application, wrappers read authoritative application settings from Argo CD and compare them with rendered/default values.
+
+For a first deployment, if rendered config path is missing and template path equals config path, wrappers stop and request a separate approved config template path.
+
+If the user asks only to build a distributive, do not pass `--approve-deployment`.
+
+If the user explicitly asks to build and deploy to a stand, pass `--approve-deployment`.
+
+Before deployment-stage changes, wrappers print:
+- `VERSION`
+- `CONFIG_REPO`
+- `CONFIG_PATH`
+- `ARGOCD_APP_NAME`
+- `ENVIRONMENT`
+
+Do not request confirmation for read-only checks.
+
+## Preflight Policy
+
+Preflight must be read-only.
+
+When the user requests a safe check of the full process, run:
+
+`scripts/distribution-delivery.sh --preflight`
+
+Preflight must not:
+- start a Jenkins build
+- create a Jenkins job
+- commit to GitOps
+- push to GitOps
+- create an Argo CD Application
+- sync Argo CD
+- modify the cluster
+
+Report preflight machine output only.
+
+If preflight returns `STATE=jenkins_parameter_mismatch`, ask only for Jenkins parameter mapping.
+
+If preflight returns `NEXT_REQUIRED_INPUT=config template path`, ask only for the approved config template path.
+
+## Credential Policy
+
+Never display credential values.
+
+Never repeat a command containing real credentials.
+
+Credentials must be passed only through environment variables already configured in the execution environment.
+
+Do not print `JENKINS_TOKEN` or `ARGOCD_AUTH_TOKEN`.
+
+Do not print `.env`.
+
+Do not read credential values manually.
+
 
 ## Wrapper Error Policy
 
@@ -198,65 +317,50 @@ If any wrapper returns `STATUS=ERROR`:
 - do not switch to curl
 - do not suggest Maven, Gradle, Docker, or local build
 
-## Non-Goals
+## Hard Restrictions
 
-This skill must not:
-- call Jenkins API directly
+The skill must not:
+- calculate versions
+- read Jenkins console logs directly
+- analyze Jenkins failures without `scripts/jenkins-analyze-failure.sh`
+- edit GitOps config directly
+- call Argo CD directly
 - generate curl commands
+- call Jenkins API directly
+- call Argo CD API directly
 - run Maven
 - run Gradle
 - run Docker
-- inspect distributive/pom.xml
-- inspect assembly/distributive.xml
-- read README
-- read AGENTS.md
+- create Git repositories
+- create Jenkinsfiles
+- inspect distributive modules
+- inspect Jenkinsfiles
 - search git history
-- search Jenkinsfile
-- create Jenkinsfile
-- inspect the project
-- understand the project
-- analyze build files
-- verify Maven
-- determine build type
-- determine modules
-- determine distributive structure
-- calculate distributive versions
 
-## Output Format
+All decisions belong to wrapper scripts.
 
-Report wrapper output fields only:
-- Project
-- Branch
-- Jenkins URL
-- Job name
-- Action
-- Queue URL
-- Build URL
-- Result
-- Distribution type
-- Version
-- Version source
-- Previous version
-- Next required input, only if blocked
+The skill is only an orchestrator launcher and output reporter.
 
-## Hard Requirements
+## Output Policy
 
-The first executable action after resolving wrapper location MUST be:
+Report wrapper output fields only.
 
-`scripts/jenkins-lookup.sh`
+For successful delivery, report:
+- project
+- branch
+- distribution type
+- previous version
+- version
+- Jenkins build URL
+- Jenkins result
+- GitOps action
+- Argo CD application
+- Argo CD sync status
+- Argo CD health status
 
-No repository inspection is allowed before lookup.
-
-No shell commands except wrapper execution are allowed.
-
-No curl commands are allowed.
-
-No Jenkins API calls are allowed.
-
-No Maven commands are allowed.
-
-No Gradle commands are allowed.
-
-The wrappers are the authoritative implementation.
-
-The skill is only an orchestrator.
+For blocked or failed delivery, report:
+- reason
+- next required input
+- failure category
+- failure summary
+- suggested action

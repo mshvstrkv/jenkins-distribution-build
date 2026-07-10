@@ -1,6 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+ENV_FILE="${SKILL_ROOT}/.env"
+
+load_skill_env() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local perms
+  perms="$(stat -f "%Lp" "$ENV_FILE" 2>/dev/null || stat -c "%a" "$ENV_FILE" 2>/dev/null || true)"
+  if [[ -n "$perms" && "$perms" != "600" ]]; then
+    echo "WARNING=.env should have permissions 600"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue
+    local key="${line%%=*}"
+    local value="${line#*=}"
+    key="${key#"${key%%[![:space:]]*}"}"
+    key="${key%"${key##*[![:space:]]}"}"
+    [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ -n "${!key:-}" ]] || export "$key=$value"
+  done <"$ENV_FILE"
+}
+
+load_skill_env
+
 usage() {
   cat <<'EOF'
 Usage:
@@ -36,6 +60,7 @@ emit_common() {
   echo "EXISTS=${EXISTS:-}"
   echo "TEMPLATE_JOB=${TEMPLATE_JOB:-}"
   echo "CHECKED_JOB_NAMES=${CHECKED_JOB_NAMES_CSV:-}"
+  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
 }
 
 error_exit() {
@@ -47,6 +72,42 @@ error_exit() {
   echo "REASON=${reason}"
   echo "NEXT_REQUIRED_INPUT=${next_input}"
   emit_common
+  exit 1
+}
+
+sanitize_technical_reason() {
+  sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
+}
+
+is_corporate_network_error() {
+  case "$1" in
+    *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*)
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+corporate_environment_required_exit() {
+  echo "STATUS=ERROR"
+  echo "STATE=corporate_environment_required"
+  echo "REASON=This operation requires corporate network access"
+  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
+  emit_common
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+corporate_network_unavailable_exit() {
+  local technical_reason="$1"
+  technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
+  echo "STATUS=ERROR"
+  echo "STATE=corporate_network_unavailable"
+  echo "REASON=Corporate service is unreachable from the current environment"
+  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
+  emit_common
+  echo "MUTATIONS_PERFORMED=false"
+  [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
   exit 1
 }
 
@@ -136,6 +197,7 @@ CHECKED_JOB_NAMES=()
 CHECKED_JOB_NAMES_CSV=""
 CURL_STATUS=""
 CURL_ERROR_MESSAGE=""
+EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -164,6 +226,11 @@ while [[ $# -gt 0 ]]; do
       TEMPLATE_JOB="$2"
       shift 2
       ;;
+    --execution-environment)
+      require_value "$1" "${2:-}"
+      EXECUTION_ENVIRONMENT="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -176,6 +243,10 @@ done
 
 [[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
 [[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
+case "$EXECUTION_ENVIRONMENT" in
+  local|corporate) ;;
+  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
+esac
 [[ -n "${JENKINS_USER:-}" ]] || error_exit "Missing required environment variable: JENKINS_USER" "JENKINS_USER"
 [[ -n "${JENKINS_TOKEN:-}" ]] || error_exit "Missing required environment variable: JENKINS_TOKEN" "JENKINS_TOKEN"
 command -v curl >/dev/null 2>&1 || error_exit "curl is required but was not found" "curl"
@@ -183,6 +254,10 @@ command -v python3 >/dev/null 2>&1 || error_exit "python3 is required but was no
 
 JENKINS_URL="${JENKINS_URL%/}"
 build_candidate_job_names
+
+if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
+  corporate_environment_required_exit
+fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -193,6 +268,9 @@ ERROR_FILE="${TMP_DIR}/curl-error"
 for candidate in "${CHECKED_JOB_NAMES[@]}"; do
   candidate_url="$(job_url_for "$candidate")"
   if ! curl_get_status "$BODY_FILE" "$HEADERS_FILE" "${candidate_url}/api/json"; then
+    if is_corporate_network_error "$CURL_ERROR_MESSAGE"; then
+      corporate_network_unavailable_exit "$CURL_ERROR_MESSAGE"
+    fi
     error_exit "$CURL_ERROR_MESSAGE" "Jenkins access"
   fi
 
