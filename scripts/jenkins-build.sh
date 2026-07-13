@@ -83,7 +83,14 @@ emit_common() {
   echo "JOB_URL=${JOB_URL:-}"
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
+  echo "BUILD_NUMBER=${BUILD_NUMBER:-}"
   echo "RESULT=${RESULT:-}"
+  echo "BUILDING=${BUILDING:-}"
+  echo "STATUS_VERIFIED=${STATUS_VERIFIED:-false}"
+  echo "STATUS_VERIFIED_AT=${STATUS_VERIFIED_AT:-}"
+  echo "API_BUILD_URL=${API_BUILD_URL:-}"
+  echo "EXPECTED_BUILD_NUMBER=${EXPECTED_BUILD_NUMBER:-}"
+  echo "API_BUILD_NUMBER=${API_BUILD_NUMBER:-}"
   echo "BUILD_TRIGGERED=${BUILD_TRIGGERED:-false}"
   echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE:-}"
   echo "VERSION=${VERSION:-}"
@@ -352,6 +359,46 @@ sys.exit(2)
 PY
 }
 
+build_number_from_url() {
+  local url="$1"
+  python3 - "$url" <<'PY'
+import re
+import sys
+
+match = re.search(r"/(\d+)/?$", sys.argv[1].rstrip("/"))
+print(match.group(1) if match else "")
+PY
+}
+
+json_build_status_fields() {
+  local json_file="$1"
+  python3 - "$json_file" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception:
+    sys.exit(1)
+
+building = payload.get("building")
+if isinstance(building, bool):
+    building_value = "true" if building else "false"
+else:
+    building_value = "invalid"
+
+result = payload.get("result")
+if result is None:
+    result = ""
+
+print(f"API_BUILD_URL={(payload.get('url') or '').rstrip('/')}")
+print(f"API_BUILD_NUMBER={'' if payload.get('number') is None else payload.get('number')}")
+print(f"BUILDING={building_value}")
+print(f"RESULT={result}")
+PY
+}
+
 version_from_builds_json() {
   local distribution_type="$1"
   local json_file="$2"
@@ -505,6 +552,8 @@ curl_http() {
   shift 2
 
   local status
+  : >"$body_file"
+  : >"$headers_file"
   if ! status="$(curl --silent --show-error --output "$body_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@" 2>"$ERROR_FILE")"; then
     local message
     message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
@@ -601,6 +650,16 @@ jenkins_status_unavailable_exit() {
   exit 1
 }
 
+jenkins_build_identity_mismatch_exit() {
+  STATE="jenkins_build_identity_mismatch"
+  NEXT_REQUIRED_INPUT="Jenkins build status access"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Jenkins returned status for a different build"
+  emit_common
+  exit 1
+}
+
 build_wait_timeout_exit() {
   STATE="build_wait_timeout"
   NEXT_REQUIRED_INPUT="${1:-more time or Jenkins build inspection}"
@@ -615,6 +674,7 @@ curl_get_jenkins_api_follow_redirect() {
   local current_url="$1"
   local update_build_url="${2:-false}"
   local status location next_url redirect_count=0
+  CURL_GET_STATUS=""
 
   while true; do
     status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
@@ -626,12 +686,12 @@ curl_get_jenkins_api_follow_redirect() {
       301|302|303|307|308)
         location="$(header_location "$HEADERS_FILE")"
         if [[ -z "$location" ]]; then
-          printf '562'
+          CURL_GET_STATUS="562"
           return 0
         fi
         next_url="$(absolute_url "$current_url" "$location")"
         if ! approved_jenkins_redirect_url "$next_url"; then
-          printf '561'
+          CURL_GET_STATUS="561"
           return 0
         fi
         if [[ "$update_build_url" == "true" ]]; then
@@ -644,16 +704,36 @@ curl_get_jenkins_api_follow_redirect() {
         current_url="$next_url"
         redirect_count=$((redirect_count + 1))
         if (( redirect_count > 5 )); then
-          printf '562'
+          CURL_GET_STATUS="562"
           return 0
         fi
         ;;
       *)
-        printf '%s' "$status"
+        CURL_GET_STATUS="$status"
         return 0
         ;;
     esac
   done
+}
+
+verify_build_identity_chain() {
+  local queue_build_number
+
+  EXPECTED_BUILD_NUMBER="$(build_number_from_url "$BUILD_URL")"
+  if [[ -z "$EXPECTED_BUILD_NUMBER" ]]; then
+    jenkins_build_identity_mismatch_exit
+  fi
+
+  if [[ -n "$QUEUE_EXECUTABLE_URL" ]]; then
+    queue_build_number="$(build_number_from_url "$QUEUE_EXECUTABLE_URL")"
+    if [[ -z "$queue_build_number" || "$queue_build_number" != "$EXPECTED_BUILD_NUMBER" ]]; then
+      jenkins_build_identity_mismatch_exit
+    fi
+  fi
+
+  if [[ "${API_BUILD_URL%/}" != "${BUILD_URL%/}" || "$API_BUILD_NUMBER" != "$EXPECTED_BUILD_NUMBER" ]]; then
+    jenkins_build_identity_mismatch_exit
+  fi
 }
 
 job_url_for() {
@@ -801,7 +881,7 @@ recover_existing_build() {
   [[ "$DRY_RUN" != "true" ]] || return 1
   [[ -n "$JOB_NAME" && -n "$JOB_URL" && -n "$BRANCH" && -n "$VERSION" ]] || return 1
 
-  local root_url status recovery_output queue_url build_url recovered_result
+  local root_url status recovery_output queue_url build_url
   root_url="$(jenkins_root_url "$JENKINS_URL")"
 
   status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
@@ -839,10 +919,8 @@ recover_existing_build() {
       if recovery_output="$(json_recovery_match builds "$BODY_FILE" "$root_url" 2>/dev/null)"; then
         queue_url="$(sed -n 's/^QUEUE_URL=//p' <<<"$recovery_output" | tail -n 1)"
         build_url="$(sed -n 's/^BUILD_URL=//p' <<<"$recovery_output" | tail -n 1)"
-        recovered_result="$(sed -n 's/^RESULT=//p' <<<"$recovery_output" | tail -n 1)"
         QUEUE_URL="$queue_url"
         BUILD_URL="$build_url"
-        RESULT="$recovered_result"
         BUILD_TRIGGERED=true
         ACTION="recovered"
         MUTATIONS_PERFORMED=false
@@ -984,6 +1062,47 @@ done
 : >"$headers"
 mkdir -p "$(dirname "$output")"
 
+build_json() {
+  local number="$1"
+  local building="$2"
+  local result="$3"
+  local result_json timestamp_part api_url host
+  if [[ "$result" == "null" ]]; then
+    result_json="null"
+  else
+    result_json="\"$result\""
+  fi
+  timestamp_part=""
+  if [[ -n "${4:-}" ]]; then
+    timestamp_part=",\"timestamp\":$4"
+  fi
+  host="aipay.ci.jenkins.sberbank.ru"
+  case "$url" in
+    https://ci.jenkins.sberbank.ru/*) host="ci.jenkins.sberbank.ru" ;;
+  esac
+  api_url="https://${host}/job/aipay/job/SberAiPay_CI/job/test-project-build/${number}/"
+  printf '{"number":%s,"url":"%s","building":%s,"result":%s%s,"artifacts":[]}\n' "$number" "$api_url" "$building" "$result_json" "$timestamp_part"
+}
+
+builds_json() {
+  local number="$1"
+  local building="$2"
+  local result="$3"
+  local dtype="$4"
+  local timestamp="$5"
+  local result_json timestamp_part
+  if [[ "$result" == "null" ]]; then
+    result_json="null"
+  else
+    result_json="\"$result\""
+  fi
+  timestamp_part=""
+  if [[ -n "$timestamp" ]]; then
+    timestamp_part=",\"timestamp\":$timestamp"
+  fi
+  printf '{"builds":[{"number":%s,"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/%s/","building":%s,"result":%s%s,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"%s"}]}]}]}\n' "$number" "$number" "$building" "$result_json" "$timestamp_part" "$dtype"
+}
+
 if [[ "$url" == *"/crumbIssuer/api/json" ]]; then
   printf '{}\n' >"$output"
   printf '404'
@@ -1006,29 +1125,29 @@ fi
 if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/api/json?tree=builds"* ]]; then
   case "$JENKINS_BUILD_WAIT_SCENARIO" in
     recovery-running)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":true,"result":null,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 true null ift "" >"$output"
       ;;
     recovery-recent-success)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 false SUCCESS ift 0 >"$output"
       ;;
     recovery-old-success)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":-999999999,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 false SUCCESS ift -999999999 >"$output"
       ;;
     recovery-recent-failure)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"FAILURE","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 false FAILURE ift 0 >"$output"
       ;;
     recovery-old-failure)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"FAILURE","timestamp":-999999999,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 false FAILURE ift -999999999 >"$output"
       ;;
     recovery-aborted)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"ABORTED","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      builds_json 44 false ABORTED ift 0 >"$output"
       ;;
     recovery-dtype-mismatch)
-      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":true,"result":null,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"release"}]}]}]}\n' >"$output"
+      builds_json 44 true null release "" >"$output"
       ;;
     repeated-restart)
       if [[ -f "${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-count" ]]; then
-        printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+        builds_json 44 false SUCCESS ift 0 >"$output"
       else
         printf '{"builds":[]}\n' >"$output"
       fi
@@ -1054,8 +1173,27 @@ if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
 fi
 
 if [[ "$url" == *"/queue/item/1/api/json" ]]; then
+  if [[ "$JENKINS_BUILD_WAIT_SCENARIO" == "queue-executable-mismatch" ]]; then
+    printf '{"executable":{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/45/"}}\n' >"$output"
+    printf '200'
+    exit 0
+  fi
   printf '{"executable":{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/"}}\n' >"$output"
   printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/45/api/json" ]]; then
+  case "$JENKINS_BUILD_WAIT_SCENARIO" in
+    queue-executable-mismatch)
+      build_json 44 false SUCCESS >"$output"
+      printf '200'
+      ;;
+    *)
+      printf '{}\n' >"$output"
+      printf '500'
+      ;;
+  esac
   exit 0
 fi
 
@@ -1072,10 +1210,10 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
         printf '{}\n' >"$output"
         printf '302'
       elif [[ "$count" == "2" ]]; then
-        printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+        build_json 44 true null >"$output"
         printf '200'
       else
-        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        build_json 44 false SUCCESS >"$output"
         printf '200'
       fi
       ;;
@@ -1085,7 +1223,7 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
         printf '{}\n' >"$output"
         printf '302'
       else
-        printf '{"building":false,"result":"FAILURE","artifacts":[]}\n' >"$output"
+        build_json 44 false FAILURE >"$output"
         printf '200'
       fi
       ;;
@@ -1094,12 +1232,12 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
         printf '{}\n' >"$output"
         printf '404'
       else
-        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        build_json 44 false SUCCESS >"$output"
         printf '200'
       fi
       ;;
     timeout)
-      printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+      build_json 44 true null >"$output"
       printf '200'
       ;;
     redirect-rejected)
@@ -1109,20 +1247,41 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
       ;;
     recovery-queue|recovery-running)
       if [[ "$count" == "1" ]]; then
-        printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+        build_json 44 true null >"$output"
         printf '200'
       else
-        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        build_json 44 false SUCCESS >"$output"
         printf '200'
       fi
       ;;
-    recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
-      printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+    confirmed-success|recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
+      build_json 44 false SUCCESS >"$output"
       printf '200'
       ;;
     recovery-recent-failure|recovery-old-failure)
-      printf '{"building":false,"result":"FAILURE","artifacts":[]}\n' >"$output"
+      build_json 44 false FAILURE >"$output"
       printf '200'
+      ;;
+    stale-previous-success)
+      build_json 45 false SUCCESS >"$output"
+      printf '200'
+      ;;
+    inconsistent-success)
+      if [[ "$count" == "1" ]]; then
+        build_json 44 true SUCCESS >"$output"
+      else
+        build_json 44 false SUCCESS >"$output"
+      fi
+      printf '200'
+      ;;
+    stale-body-curl-failure)
+      if [[ "$count" == "1" ]]; then
+        build_json 44 false SUCCESS >"$output"
+        printf '302'
+      else
+        printf '{}\n' >"$output"
+        printf '500'
+      fi
       ;;
   esac
   exit 0
@@ -1140,7 +1299,8 @@ EOF
     local expected_pattern="$3"
     local timeout_seconds="${4:-100}"
     local expected_trigger_count="${5:-1}"
-    local case_dir output rc trigger_count
+    local expected_build_count="${6:-}"
+    local case_dir output rc trigger_count build_count
     case_dir="$tmp/$scenario"
     mkdir -p "$case_dir"
     set +e
@@ -1190,6 +1350,14 @@ EOF
       echo "FAIL ${scenario} trigger count ${trigger_count}"
       exit 1
     }
+    if [[ -n "$expected_build_count" ]]; then
+      build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
+      [[ "$build_count" == "$expected_build_count" ]] || {
+        printf '%s\n' "$output"
+        echo "FAIL ${scenario} build poll count ${build_count}"
+        exit 1
+      }
+    fi
   }
 
   run_restart_case() {
@@ -1251,10 +1419,15 @@ EOF
   }
 
   run_case redirect-success success "RESULT=SUCCESS"
+  run_case confirmed-success success "STATUS_VERIFIED=true"
   run_case redirect-failure success "RESULT=FAILURE"
   run_case transient-404 success "RESULT=SUCCESS"
   run_case timeout failure "STATE=build_wait_timeout" 1
   run_case redirect-rejected failure "STATE=jenkins_redirect_rejected"
+  run_case stale-previous-success failure "STATE=jenkins_build_identity_mismatch" 100 1
+  run_case queue-executable-mismatch failure "STATE=jenkins_build_identity_mismatch" 100 1
+  run_case inconsistent-success success "STATUS_VERIFIED=true" 100 1 2
+  run_case stale-body-curl-failure failure "STATE=jenkins_build_status_unavailable" 100 1
   run_case recovery-queue success "ACTION=recovered" 100 0
   run_case recovery-running success "ACTION=recovered" 100 0
   run_case recovery-recent-success success "ACTION=recovered" 100 0
@@ -1273,7 +1446,7 @@ wait_for_build() {
   [[ "$WAIT" == "true" && "$DRY_RUN" != "true" ]] || return 0
   [[ -n "$QUEUE_URL" || -n "$BUILD_URL" ]] || error_exit "Build was triggered but Jenkins did not return queue or build URL" "queue or build URL"
 
-  local start now status executable_url result
+  local start now status executable_url result status_fields
   start="$(date +%s)"
 
   if [[ -z "$BUILD_URL" ]]; then
@@ -1283,13 +1456,15 @@ wait_for_build() {
         build_wait_timeout_exit "more time or Jenkins queue inspection"
       fi
 
-      status="$(curl_get_jenkins_api_follow_redirect "${QUEUE_URL%/}/api/json" false)"
+      curl_get_jenkins_api_follow_redirect "${QUEUE_URL%/}/api/json" false
+      status="$CURL_GET_STATUS"
 
       case "$status" in
         200)
           executable_url="$(json_field "executable.url" "$BODY_FILE" || true)"
           if [[ -n "$executable_url" ]]; then
-            BUILD_URL="${executable_url%/}"
+            QUEUE_EXECUTABLE_URL="${executable_url%/}"
+            BUILD_URL="$QUEUE_EXECUTABLE_URL"
             break
           fi
           ;;
@@ -1317,16 +1492,35 @@ wait_for_build() {
       build_wait_timeout_exit "more time or Jenkins build inspection"
     fi
 
-    status="$(curl_get_jenkins_api_follow_redirect "${BUILD_URL}/api/json" true)"
+    curl_get_jenkins_api_follow_redirect "${BUILD_URL}/api/json" true
+    status="$CURL_GET_STATUS"
 
     case "$status" in
       200)
-        result="$(json_field "result" "$BODY_FILE" || true)"
-        if [[ -n "$result" ]]; then
-          RESULT="$result"
-          ARTIFACT_URLS="$(json_artifact_urls "$BODY_FILE" | paste -sd ',' - || true)"
-          return 0
+        status_fields="$(json_build_status_fields "$BODY_FILE" || true)"
+        if [[ -z "$status_fields" ]]; then
+          jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins build status access"
         fi
+        API_BUILD_URL="$(sed -n 's/^API_BUILD_URL=//p' <<<"$status_fields" | tail -n 1)"
+        API_BUILD_NUMBER="$(sed -n 's/^API_BUILD_NUMBER=//p' <<<"$status_fields" | tail -n 1)"
+        BUILDING="$(sed -n 's/^BUILDING=//p' <<<"$status_fields" | tail -n 1)"
+        result="$(sed -n 's/^RESULT=//p' <<<"$status_fields" | tail -n 1)"
+        verify_build_identity_chain
+        BUILD_NUMBER="$API_BUILD_NUMBER"
+        case "$BUILDING:$result" in
+          false:SUCCESS|false:FAILURE|false:UNSTABLE|false:ABORTED)
+            RESULT="$result"
+            STATUS_VERIFIED=true
+            STATUS_VERIFIED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            ARTIFACT_URLS="$(json_artifact_urls "$BODY_FILE" | paste -sd ',' - || true)"
+            return 0
+            ;;
+          true:*|false:)
+            ;;
+          *)
+            jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins build status access"
+            ;;
+        esac
         ;;
       404)
         ;;
@@ -1373,7 +1567,16 @@ JOB_NAME=""
 JOB_URL=""
 QUEUE_URL=""
 BUILD_URL=""
+QUEUE_EXECUTABLE_URL=""
+BUILD_NUMBER=""
 RESULT=""
+BUILDING=""
+CURL_GET_STATUS=""
+STATUS_VERIFIED=false
+STATUS_VERIFIED_AT=""
+API_BUILD_URL=""
+EXPECTED_BUILD_NUMBER=""
+API_BUILD_NUMBER=""
 STATE=""
 BUILD_TRIGGERED=false
 MUTATIONS_PERFORMED=false

@@ -24,6 +24,7 @@ Usage:
     [--jenkins-version-param <name>] \
     [--jenkins-distribution-type-param <name>] \
     [--wait] \
+    [--recovery-window-seconds <number>] \
     [--timeout-seconds <number>] \
     [--dry-run] \
     [--self-test]
@@ -44,7 +45,11 @@ emit_flow_output() {
   echo "VERSION_SOURCE=${VERSION_SOURCE:-}"
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
+  echo "BUILD_NUMBER=${BUILD_NUMBER:-}"
   echo "RESULT=${RESULT:-}"
+  echo "BUILDING=${BUILDING:-}"
+  echo "STATUS_VERIFIED=${STATUS_VERIFIED:-false}"
+  echo "STATUS_VERIFIED_AT=${STATUS_VERIFIED_AT:-}"
   echo "FAILURE_CATEGORY=${FAILURE_CATEGORY:-}"
   echo "FAILURE_SUMMARY=${FAILURE_SUMMARY:-}"
   echo "SUGGESTED_ACTION=${SUGGESTED_ACTION:-}"
@@ -154,6 +159,7 @@ EOF
       --branch develop \
       --distribution-type ift \
       --job-name test-project-build \
+      --recovery-window-seconds 120 \
       --wait
   )"
   rc=$?
@@ -163,6 +169,7 @@ EOF
   [[ "$(sed -n '2s/ .*//p' "$log")" == "version" ]] || { echo "FAIL call sequence version"; exit 1; }
   [[ "$(sed -n '3s/ .*//p' "$log")" == "build" ]] || { echo "FAIL call sequence build"; exit 1; }
   grep -q -- "--skip-lookup" "$log" || { echo "FAIL build missing --skip-lookup"; exit 1; }
+  grep -q -- "--recovery-window-seconds 120" "$log" || { echo "FAIL build missing recovery window"; exit 1; }
   grep -q "STATUS=OK" <<<"$output" || { echo "FAIL flow output status"; exit 1; }
   echo "JENKINS_BUILD_FLOW_SELF_TESTS=OK"
 }
@@ -182,6 +189,7 @@ JENKINS_VERSION_PARAM="VERSION"
 JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
 WAIT=false
 TIMEOUT_SECONDS=1800
+RECOVERY_WINDOW_SECONDS=3600
 DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
@@ -198,6 +206,7 @@ while [[ $# -gt 0 ]]; do
     --jenkins-version-param) require_value "$1" "${2:-}"; JENKINS_VERSION_PARAM="$2"; shift 2 ;;
     --jenkins-distribution-type-param) require_value "$1" "${2:-}"; JENKINS_DISTRIBUTION_TYPE_PARAM="$2"; shift 2 ;;
     --wait) WAIT=true; shift ;;
+    --recovery-window-seconds) require_value "$1" "${2:-}"; RECOVERY_WINDOW_SECONDS="$2"; shift 2 ;;
     --timeout-seconds) require_value "$1" "${2:-}"; TIMEOUT_SECONDS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --help|-h) usage; exit 0 ;;
@@ -217,6 +226,7 @@ esac
 [[ -n "$BRANCH" ]] || flow_error "Missing required argument: --branch" "branch"
 [[ -n "$DISTRIBUTION_TYPE" ]] || flow_error "Missing required argument: --distribution-type" "distribution type"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || flow_error "--timeout-seconds must be a number" "timeout seconds"
+[[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || flow_error "--recovery-window-seconds must be a number" "recovery window seconds"
 if ! DISTRIBUTION_TYPE="$(normalize_type_with_python "$DISTRIBUTION_TYPE")"; then
   flow_error "Unsupported distribution type" "ift or release"
 fi
@@ -294,6 +304,7 @@ build_args=(
   --jenkins-branch-param "$JENKINS_BRANCH_PARAM"
   --jenkins-version-param "$JENKINS_VERSION_PARAM"
   --jenkins-distribution-type-param "$JENKINS_DISTRIBUTION_TYPE_PARAM"
+  --recovery-window-seconds "$RECOVERY_WINDOW_SECONDS"
   --timeout-seconds "$TIMEOUT_SECONDS"
 )
 [[ "$WAIT" == "true" ]] && build_args+=(--wait)
@@ -303,7 +314,11 @@ STATUS="$(value_from_output STATUS "$BUILD_OUTPUT")"
 JOB_URL="$(value_from_output JOB_URL "$BUILD_OUTPUT")"
 QUEUE_URL="$(value_from_output QUEUE_URL "$BUILD_OUTPUT")"
 BUILD_URL="$(value_from_output BUILD_URL "$BUILD_OUTPUT")"
+BUILD_NUMBER="$(value_from_output BUILD_NUMBER "$BUILD_OUTPUT")"
 RESULT="$(value_from_output RESULT "$BUILD_OUTPUT")"
+BUILDING="$(value_from_output BUILDING "$BUILD_OUTPUT")"
+STATUS_VERIFIED="$(value_from_output STATUS_VERIFIED "$BUILD_OUTPUT")"
+STATUS_VERIFIED_AT="$(value_from_output STATUS_VERIFIED_AT "$BUILD_OUTPUT")"
 VERSION="$(value_from_output VERSION "$BUILD_OUTPUT")"
 VERSION_SOURCE="$(value_from_output VERSION_SOURCE "$BUILD_OUTPUT")"
 PREVIOUS_VERSION="$(value_from_output PREVIOUS_VERSION "$BUILD_OUTPUT")"

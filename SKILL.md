@@ -50,6 +50,38 @@ The skill must not call `curl`, `git`, or `argocd` directly.
 
 The skill must pass arguments to the CLI and report machine output.
 
+## No-Question Execution Policy
+
+When all required build inputs are present in the user request, execute:
+
+`scripts/distribution build`
+
+immediately.
+
+Do not:
+- create a plan file
+- create todo items
+- ask for confirmation
+- ask again for distribution type
+- ask again for execution environment
+- ask again for Jenkins URL
+- ask again for project name
+- ask again for branch
+- ask for job name when lookup can resolve it
+- ask for recovery window when a default exists
+- inspect environment variables manually
+- read `.env`
+- print `.env`
+- extract credentials from `.env` into a shell command
+
+The wrappers load skill-root `.env` themselves.
+
+The agent must execute exactly one CLI command and report its final machine output.
+
+If the user says "проверь через 10 минут", do not interpret it as a recovery-window value. It means wait before checking status, not change `--recovery-window-seconds`.
+
+Do not create `.gigacode/plans/*` for a simple build request.
+
 ## Jenkins Build Policy
 
 `scripts/distribution build` runs the Jenkins-only orchestrated flow.
