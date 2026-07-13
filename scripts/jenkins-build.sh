@@ -42,6 +42,7 @@ Usage:
     [--jenkins-branch-param <name>] \
     [--jenkins-version-param <name>] \
     [--jenkins-distribution-type-param <name>] \
+    [--skip-lookup] \
     [--dry-run] \
     [--wait] \
     [--timeout-seconds <number>]
@@ -60,6 +61,7 @@ Optional arguments:
   --jenkins-branch-param             Jenkins branch parameter name, default BRANCH
   --jenkins-version-param            Jenkins version parameter name, default VERSION
   --jenkins-distribution-type-param  Jenkins distribution type parameter name, default DISTRIBUTION_TYPE
+  --skip-lookup        Use the explicit --job-name without running Jenkins job lookup
   --dry-run            Print intended actions without changing Jenkins
   --wait               Wait until the queued build completes
   --timeout-seconds    Wait timeout, default 1800
@@ -700,6 +702,7 @@ JENKINS_BRANCH_PARAM="BRANCH"
 JENKINS_VERSION_PARAM="VERSION"
 JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
 RESOLVE_VERSION_ONLY=false
+SKIP_LOOKUP=false
 DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
@@ -782,6 +785,10 @@ while [[ $# -gt 0 ]]; do
       JENKINS_DISTRIBUTION_TYPE_PARAM="$2"
       shift 2
       ;;
+    --skip-lookup)
+      SKIP_LOOKUP=true
+      shift
+      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -818,6 +825,9 @@ case "$EXECUTION_ENVIRONMENT" in
   *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
 esac
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
+if [[ "$SKIP_LOOKUP" == "true" && -z "$JOB_NAME_ARG" ]]; then
+  error_exit "--skip-lookup requires --job-name" "job name"
+fi
 raw_distribution_type="$DISTRIBUTION_TYPE"
 if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$raw_distribution_type")"; then
   error_exit "Unsupported distribution type: ${raw_distribution_type}" "distribution type"
@@ -850,7 +860,12 @@ else
   if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
     corporate_environment_required_exit
   fi
-  if ! find_existing_job; then
+  if [[ "$SKIP_LOOKUP" == "true" ]]; then
+    JOB_NAME="$JOB_NAME_ARG"
+    JOB_URL="$(job_url_for "$JOB_NAME")"
+    ACTION="reused"
+    build_candidate_job_names
+  elif ! find_existing_job; then
     if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
       error_exit "Jenkins job not found. Checked: ${CHECKED_JOB_NAMES[*]}." "existing Jenkins job"
     fi

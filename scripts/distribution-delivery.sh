@@ -826,6 +826,7 @@ build_args=(
   --wait
 )
 [[ -n "$JOB_NAME" ]] && build_args+=(--job-name "$JOB_NAME")
+[[ -n "$JOB_NAME" ]] && build_args+=(--skip-lookup)
 [[ -n "$TEMPLATE_JOB" ]] && build_args+=(--template-job "$TEMPLATE_JOB")
 [[ -n "$VERSION" ]] && build_args+=(--version "$VERSION")
 [[ "$DRY_RUN" == "true" ]] && build_args+=(--dry-run)
