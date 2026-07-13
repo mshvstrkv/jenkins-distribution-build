@@ -223,7 +223,7 @@ run_jenkins_stage() {
   local headers="$WORK_DIR/jenkins-job.headers"
   local err="$WORK_DIR/jenkins-metadata.err"
   local status
-  status="$(curl_http_capture_error "$meta" "$headers" "$err" --user "${JENKINS_USER}:${JENKINS_TOKEN}" "$JENKINS_METADATA_URL")"
+  status="$(curl_http_capture_error "$meta" "$headers" "$err" --globoff --user "${JENKINS_USER}:${JENKINS_TOKEN}" "$JENKINS_METADATA_URL")"
   if [[ "$status" == "000" ]]; then
     JENKINS_METADATA=FAILED
     JENKINS_REASON="Failed to connect to Jenkins job metadata endpoint"

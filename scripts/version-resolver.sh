@@ -184,7 +184,7 @@ JOB_URL="${JENKINS_URL}/job/${encoded_job}"
 BUILDS_JSON="$WORK_DIR/builds.json"
 HEADERS="$WORK_DIR/headers"
 ERROR_FILE="$WORK_DIR/curl.err"
-status="$(curl_http "$BUILDS_JSON" "$HEADERS" "$ERROR_FILE" --user "${JENKINS_USER}:${JENKINS_TOKEN}" "${JOB_URL}/api/json?tree=builds[number,url,result,displayName,description,actions[parameters[name,value]]]")"
+status="$(curl_http "$BUILDS_JSON" "$HEADERS" "$ERROR_FILE" --globoff --user "${JENKINS_USER}:${JENKINS_TOKEN}" "${JOB_URL}/api/json?tree=builds[number,url,result,displayName,description,actions[parameters[name,value]]]")"
 if [[ "$status" == "000" ]]; then
   message="$(tr '\n' ' ' <"$ERROR_FILE" | sanitize_technical_reason | sed 's/[[:space:]]\+/ /g')"
   echo "STATUS=ERROR"
