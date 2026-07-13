@@ -9,8 +9,9 @@ load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
   local perms
   perms="$(stat -f "%Lp" "$ENV_FILE" 2>/dev/null || stat -c "%a" "$ENV_FILE" 2>/dev/null || true)"
-  if [[ -n "$perms" && "$perms" != "600" ]]; then
+  if [[ -n "$perms" && "$perms" != "600" && "${SKILL_ENV_WARNING_EMITTED:-}" != "1" ]]; then
     echo "WARNING=.env should have permissions 600"
+    export SKILL_ENV_WARNING_EMITTED=1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue
@@ -88,6 +89,7 @@ emit_common() {
   echo "JENKINS_PARAMETER_VERSION=${JENKINS_VERSION_PARAM:-}"
   echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_DISTRIBUTION_TYPE_PARAM:-}"
   echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "CHILD_EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
 }
 
 error_exit() {
@@ -361,50 +363,18 @@ resolve_version() {
     return 0
   fi
 
-  [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "--distribution-type is required when --version is not provided" "distribution type"
-  validate_version_format "$DISTRIBUTION_TYPE" "$(next_version "$DISTRIBUTION_TYPE" "")"
-
   if [[ "$DRY_RUN" == "true" ]]; then
     PREVIOUS_VERSION=""
-    VERSION="$(next_version "$DISTRIBUTION_TYPE" "")"
+    case "$DISTRIBUTION_TYPE" in
+      ift) VERSION="IFT-0.0.1" ;;
+      release) VERSION="D-00.000.01" ;;
+      *) error_exit "Unsupported distribution type: ${DISTRIBUTION_TYPE}" "distribution type" ;;
+    esac
     VERSION_SOURCE="default"
     return 0
   fi
 
-  local status previous
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/api/json?tree=builds[number,url,result,displayName,description,actions[parameters[name,value]]]")"
-
-  case "$status" in
-    200)
-      previous="$(version_from_builds_json "$DISTRIBUTION_TYPE" "$BODY_FILE" 2>"$ERROR_FILE")" || {
-        local message
-        message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
-        error_exit "$message" "valid Jenkins builds JSON"
-      }
-      PREVIOUS_VERSION="$previous"
-      VERSION="$(next_version "$DISTRIBUTION_TYPE" "$PREVIOUS_VERSION" 2>"$ERROR_FILE")" || {
-        local message
-        message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
-        error_exit "$message" "valid previous version"
-      }
-      if [[ -n "$PREVIOUS_VERSION" ]]; then
-        VERSION_SOURCE="auto"
-      else
-        VERSION_SOURCE="default"
-      fi
-      ;;
-    401|403)
-      error_exit "Jenkins access denied while resolving version: HTTP ${status}" "valid Jenkins credentials"
-      ;;
-    *)
-      warn "Could not read previous Jenkins builds for version resolution: HTTP ${status}; using initial version"
-      PREVIOUS_VERSION=""
-      VERSION="$(next_version "$DISTRIBUTION_TYPE" "")"
-      VERSION_SOURCE="default"
-      ;;
-  esac
+  error_exit "--version is required; run scripts/version-resolver.sh first" "resolved version"
 }
 
 curl_http() {
@@ -646,62 +616,7 @@ trigger_build() {
 }
 
 run_version_self_tests() {
-  local tmp_dir json_file previous actual failed=0
-  tmp_dir="$(mktemp -d)"
-  json_file="${tmp_dir}/builds.json"
-
-  printf '{"builds":[]}\n' >"$json_file"
-  previous="$(version_from_builds_json ift "$json_file")"
-  actual="$(next_version ift "$previous")"
-  [[ "$actual" == "IFT-0.0.1" ]] || { echo "FAIL ift none: ${actual}"; failed=1; }
-
-  printf '{"builds":[{"actions":[{"parameters":[{"name":"VERSION","value":"IFT-0.0.1"}]}]}]}\n' >"$json_file"
-  previous="$(version_from_builds_json ift "$json_file")"
-  actual="$(next_version ift "$previous")"
-  [[ "$actual" == "IFT-0.0.2" ]] || { echo "FAIL ift patch: ${actual}"; failed=1; }
-
-  printf '{"builds":[{"displayName":"IFT-0.1.1"},{"description":"D-00.000.09"}]}\n' >"$json_file"
-  previous="$(version_from_builds_json ift "$json_file")"
-  actual="$(next_version ift "$previous")"
-  [[ "$actual" == "IFT-0.1.2" ]] || { echo "FAIL ift ignores release: ${actual}"; failed=1; }
-
-  printf '{"builds":[]}\n' >"$json_file"
-  previous="$(version_from_builds_json release "$json_file")"
-  actual="$(next_version release "$previous")"
-  [[ "$actual" == "D-00.000.01" ]] || { echo "FAIL release none: ${actual}"; failed=1; }
-
-  printf '{"builds":[{"actions":[{"parameters":[{"name":"DISTRIBUTIVE_VERSION","value":"D-00.000.01"}]}]}]}\n' >"$json_file"
-  previous="$(version_from_builds_json release "$json_file")"
-  actual="$(next_version release "$previous")"
-  [[ "$actual" == "D-00.000.02" ]] || { echo "FAIL release patch: ${actual}"; failed=1; }
-
-  printf '{"builds":[{"displayName":"D-00.000.09"},{"description":"IFT-0.9.9"}]}\n' >"$json_file"
-  previous="$(version_from_builds_json release "$json_file")"
-  actual="$(next_version release "$previous")"
-  [[ "$actual" == "D-00.000.10" ]] || { echo "FAIL release ignores ift: ${actual}"; failed=1; }
-
-  printf '{"builds":[{"displayName":"D-00.001.99"}]}\n' >"$json_file"
-  previous="$(version_from_builds_json release "$json_file")"
-  if actual="$(next_version release "$previous" 2>/dev/null)"; then
-    echo "FAIL release overflow: ${actual}"
-    failed=1
-  fi
-
-  if [[ "$failed" == "0" ]]; then
-    [[ "$(normalize_distribution_type test)" == "ift" ]] || { echo "FAIL alias test"; failed=1; }
-    [[ "$(normalize_distribution_type testing)" == "ift" ]] || { echo "FAIL alias testing"; failed=1; }
-    [[ "$(normalize_distribution_type prod)" == "release" ]] || { echo "FAIL alias prod"; failed=1; }
-    [[ "$(normalize_distribution_type production)" == "release" ]] || { echo "FAIL alias production"; failed=1; }
-  fi
-
-  if [[ "$failed" == "0" ]]; then
-    echo "VERSION_SELF_TESTS=OK"
-    rm -rf "$tmp_dir"
-  else
-    echo "VERSION_SELF_TESTS=FAIL"
-    rm -rf "$tmp_dir"
-    exit 1
-  fi
+  bash "$SCRIPT_DIR/version-resolver.sh" --self-test
 }
 
 wait_for_build() {

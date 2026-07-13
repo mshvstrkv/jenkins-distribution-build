@@ -9,8 +9,9 @@ load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
   local perms
   perms="$(stat -f "%Lp" "$ENV_FILE" 2>/dev/null || stat -c "%a" "$ENV_FILE" 2>/dev/null || true)"
-  if [[ -n "$perms" && "$perms" != "600" ]]; then
+  if [[ -n "$perms" && "$perms" != "600" && "${SKILL_ENV_WARNING_EMITTED:-}" != "1" ]]; then
     echo "WARNING=.env should have permissions 600"
+    export SKILL_ENV_WARNING_EMITTED=1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="${line%$'\r'}"
@@ -155,6 +156,7 @@ error_exit() {
   echo "REASON=$1"
   echo "NEXT_REQUIRED_INPUT=${2:-}"
   echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
   exit 1
 }
 
@@ -179,6 +181,7 @@ corporate_environment_required_exit() {
   echo "REASON=This operation requires corporate network access"
   echo "NEXT_REQUIRED_INPUT=run inside corporate network"
   echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
   echo "MUTATIONS_PERFORMED=false"
   exit 1
 }
@@ -191,6 +194,7 @@ corporate_network_unavailable_exit() {
   echo "REASON=Corporate service is unreachable from the current environment"
   echo "NEXT_REQUIRED_INPUT=run inside corporate network"
   echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
   echo "MUTATIONS_PERFORMED=false"
   [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
   exit 1
@@ -358,6 +362,34 @@ curl_http() {
     status="000"
   fi
   printf '%s' "$status"
+}
+
+curl_http_capture_error() {
+  local body_file="$1"
+  local headers_file="$2"
+  local error_file="$3"
+  shift 3
+  local status
+  if ! status="$(curl --silent --show-error --output "$body_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@" 2>"$error_file")"; then
+    status="000"
+  fi
+  printf '%s' "$status"
+}
+
+jenkins_metadata_error_exit() {
+  local technical_reason="$1"
+  technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
+  echo "STATUS=ERROR"
+  echo "STATE=corporate_network_unavailable"
+  echo "REASON=Failed to connect to Jenkins job metadata endpoint"
+  echo "JOB_URL=${lookup_job_url:-}"
+  echo "JENKINS_METADATA_URL=${JENKINS_METADATA_URL:-}"
+  echo "NEXT_REQUIRED_INPUT=Jenkins API access"
+  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
+  echo "MUTATIONS_PERFORMED=false"
+  [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
+  exit 1
 }
 
 json_jenkins_parameters() {
@@ -596,6 +628,7 @@ commit_and_push_config() {
 
 load_skill_env
 
+ORIGINAL_ARGS=("$@")
 JENKINS_URL=""
 PROJECT_NAME=""
 BRANCH=""
@@ -620,6 +653,7 @@ CHARTS_PATH=""
 ARGOCD_APP_NAME=""
 ENVIRONMENT="ift"
 EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
+CHILD_EXECUTION_ENVIRONMENT=""
 EXECUTION_ENVIRONMENT_CLI=""
 DRY_RUN=false
 PREFLIGHT=false
@@ -670,6 +704,11 @@ case "$EXECUTION_ENVIRONMENT" in
   local|corporate) ;;
   *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
 esac
+
+if [[ "$PREFLIGHT" == "true" ]]; then
+  export SKILL_ENV_WARNING_EMITTED=1
+  exec "$SCRIPT_DIR/preflight.sh" "${ORIGINAL_ARGS[@]}"
+fi
 
 [[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
 [[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
@@ -725,7 +764,7 @@ fi
 validate_config_path
 
 if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  if [[ "$DRY_RUN" == "true" && "$PREFLIGHT" != "true" ]]; then
+  if [[ "$DRY_RUN" == "true" ]]; then
     echo "STATUS=OK"
     echo "ACTION=dry-run"
     echo "PROJECT_NAME=${PROJECT_NAME}"
@@ -748,195 +787,29 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 LOOKUP_OUTPUT="$WORK_DIR/jenkins-lookup.out"
 lookup_args=(
   "$SCRIPT_DIR/jenkins-lookup.sh"
+  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --branch "$BRANCH"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
 )
 [[ -n "$JOB_NAME" ]] && lookup_args+=(--job-name "$JOB_NAME")
 [[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
-run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
+run_and_capture "$LOOKUP_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${lookup_args[@]}" || exit 1
+JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
 
-lookup_status="$(value_from_output STATUS "$LOOKUP_OUTPUT")"
-lookup_exists="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
-lookup_next="$(value_from_output NEXT_REQUIRED_INPUT "$LOOKUP_OUTPUT")"
-if [[ "$lookup_status" == "ERROR" || -n "$lookup_next" ]]; then
-  exit 1
-fi
-lookup_job_url="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
-lookup_exists="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
-
-if [[ "$PREFLIGHT" == "true" ]]; then
-  JENKINS_JOB_EXISTS="$lookup_exists"
-  if [[ "$JENKINS_JOB_EXISTS" != "true" ]]; then
-    echo "STATUS=ERROR"
-    echo "STATE=jenkins_job_missing"
-    echo "JENKINS_JOB_EXISTS=false"
-    echo "NEXT_REQUIRED_INPUT=existing Jenkins job"
-    exit 1
-  fi
-  JOB_META="$WORK_DIR/jenkins-job.json"
-  JOB_HEADERS="$WORK_DIR/jenkins-job.headers"
-  status="$(curl_http "$JOB_META" "$JOB_HEADERS" --user "${JENKINS_USER}:${JENKINS_TOKEN}" "${lookup_job_url}/api/json?tree=property[parameterDefinitions[name]]")"
-  if [[ "$status" != "200" ]]; then
-    error_exit "Failed to read Jenkins job metadata: HTTP ${status}" "Jenkins API access"
-  fi
-  param_names="$(json_jenkins_parameters "$JOB_META")"
-  JENKINS_PARAMETER_BRANCH=""
-  JENKINS_PARAMETER_VERSION=""
-  JENKINS_PARAMETER_DISTRIBUTION_TYPE=""
-  has_csv_value "$param_names" "$JENKINS_BRANCH_PARAM" && JENKINS_PARAMETER_BRANCH="$JENKINS_BRANCH_PARAM"
-  has_csv_value "$param_names" "$JENKINS_VERSION_PARAM" && JENKINS_PARAMETER_VERSION="$JENKINS_VERSION_PARAM"
-  has_csv_value "$param_names" "$JENKINS_DISTRIBUTION_TYPE_PARAM" && JENKINS_PARAMETER_DISTRIBUTION_TYPE="$JENKINS_DISTRIBUTION_TYPE_PARAM"
-  if [[ -z "$JENKINS_PARAMETER_VERSION" || -z "$JENKINS_PARAMETER_DISTRIBUTION_TYPE" ]]; then
-    echo "STATUS=ERROR"
-    echo "STATE=jenkins_parameter_mismatch"
-    echo "JENKINS_JOB_EXISTS=${JENKINS_JOB_EXISTS}"
-    echo "JENKINS_PARAMETER_BRANCH=${JENKINS_PARAMETER_BRANCH}"
-    echo "JENKINS_PARAMETER_VERSION=${JENKINS_PARAMETER_VERSION}"
-    echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_PARAMETER_DISTRIBUTION_TYPE}"
-    echo "NEXT_REQUIRED_INPUT=Jenkins parameter mapping"
-    exit 1
-  fi
-
-  VERSION_OUTPUT="$WORK_DIR/version.out"
-  version_args=(
-    "$SCRIPT_DIR/jenkins-build.sh"
-    --resolve-version-only
-    --jenkins-url "$JENKINS_URL"
-    --project-name "$PROJECT_NAME"
-    --branch "$BRANCH"
-    --distribution-type "$DISTRIBUTION_TYPE"
-    --timeout-seconds "$TIMEOUT_SECONDS"
-    --jenkins-branch-param "$JENKINS_BRANCH_PARAM"
-    --jenkins-version-param "$JENKINS_VERSION_PARAM"
-    --jenkins-distribution-type-param "$JENKINS_DISTRIBUTION_TYPE_PARAM"
-    --execution-environment "$EXECUTION_ENVIRONMENT"
-  )
-  [[ -n "$JOB_NAME" ]] && version_args+=(--job-name "$JOB_NAME")
-  [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-  run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
-  PREVIOUS_VERSION="$(value_from_output PREVIOUS_VERSION "$VERSION_OUTPUT")"
-  VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
-  VERSION_SOURCE="$(value_from_output VERSION_SOURCE "$VERSION_OUTPUT")"
-  case "$DISTRIBUTION_TYPE:$VERSION" in
-    ift:IFT-*) ;;
-    release:D-*) ;;
-    *) echo "STATUS=ERROR"; echo "STATE=version_type_mismatch"; echo "NEXT_REQUIRED_INPUT=version"; exit 1 ;;
-  esac
-
-  clone_gitops_repo
-  CONFIG_REPO_ACCESSIBLE=true
-  [[ -e "$WORK_DIR/config-repo/$CONFIG_PATH" ]] && CONFIG_EXISTS=true || CONFIG_EXISTS=false
-  [[ -e "$WORK_DIR/config-repo/$CONFIG_TEMPLATE_PATH" ]] && CONFIG_TEMPLATE_EXISTS=true || CONFIG_TEMPLATE_EXISTS=false
-
-  ARGOCD_CLI_AVAILABLE=false
-  ARGOCD_AUTHENTICATED=false
-  ARGOCD_APP_EXISTS=false
-  ARGOCD_APP_JSON="$WORK_DIR/argocd-app.json"
-  if command -v argocd >/dev/null 2>&1; then
-    ARGOCD_CLI_AVAILABLE=true
-    ARGOCD_ARGS=(--server "$ARGOCD_SERVER")
-    if argocd "${ARGOCD_ARGS[@]}" account get-user-info >/dev/null 2>"$WORK_DIR/argocd-auth.err"; then
-      ARGOCD_AUTHENTICATED=true
-    fi
-    if argocd "${ARGOCD_ARGS[@]}" app get "$ARGOCD_APP_NAME" -o json >"$ARGOCD_APP_JSON" 2>"$WORK_DIR/argocd-app.err"; then
-      ARGOCD_APP_EXISTS=true
-    fi
-  fi
-
-  if ! DEPLOYMENT_MODE="$(deployment_mode_for_state "$CONFIG_EXISTS" "$ARGOCD_APP_EXISTS")"; then
-    echo "STATUS=ERROR"
-    echo "STATE=inconsistent"
-    echo "CONFIG_EXISTS=${CONFIG_EXISTS}"
-    echo "ARGOCD_APP_EXISTS=${ARGOCD_APP_EXISTS}"
-    echo "NEXT_REQUIRED_INPUT=manual deployment state repair"
-    exit 1
-  fi
-  if [[ "$ARGOCD_CLI_AVAILABLE" != "true" ]]; then
-    echo "STATUS=ERROR"
-    echo "NEXT_REQUIRED_INPUT=argocd CLI"
-    echo "ARGOCD_CLI_AVAILABLE=false"
-    exit 1
-  fi
-  if [[ "$ARGOCD_AUTHENTICATED" != "true" ]]; then
-    echo "STATUS=ERROR"
-    echo "NEXT_REQUIRED_INPUT=Argo CD login or ARGOCD_AUTH_TOKEN"
-    echo "ARGOCD_AUTHENTICATED=false"
-    exit 1
-  fi
-
-  if [[ "$ARGOCD_APP_EXISTS" == "true" ]]; then
-    app_fields="$(json_argocd_app_fields "$ARGOCD_APP_JSON")"
-    while IFS= read -r line; do
-      key="${line%%=*}"
-      value="${line#*=}"
-      case "$key" in
-        ARGOCD_EXISTING_PROJECT) [[ "$value" != "$ARGOCD_PROJECT" ]] && echo "WARNING=project mismatch: existing=${value} rendered=${ARGOCD_PROJECT}" ;;
-        ARGOCD_EXISTING_REPO_URL) [[ "$value" != "$CONFIG_REPO_URL" ]] && echo "WARNING=repoURL mismatch: existing=${value} rendered=${CONFIG_REPO_URL}" ;;
-        ARGOCD_EXISTING_TARGET_REVISION) [[ "$value" != "$CONFIG_REPO_BRANCH" ]] && echo "WARNING=targetRevision mismatch: existing=${value} rendered=${CONFIG_REPO_BRANCH}" ;;
-        ARGOCD_EXISTING_SOURCE_PATH) [[ "$value" != "$CONFIG_PATH" ]] && echo "WARNING=source path mismatch: existing=${value} rendered=${CONFIG_PATH}" ;;
-        ARGOCD_EXISTING_DESTINATION_SERVER) ARGOCD_DESTINATION_SERVER="$value" ;;
-        ARGOCD_EXISTING_DESTINATION_NAMESPACE) [[ "$value" != "$ARGOCD_DESTINATION_NAMESPACE" ]] && echo "WARNING=namespace mismatch: existing=${value} rendered=${ARGOCD_DESTINATION_NAMESPACE}" ;;
-      esac
-    done <<<"$app_fields"
-  elif [[ -z "$ARGOCD_DESTINATION_SERVER" && "$CONFIG_TEMPLATE_EXISTS" == "true" ]]; then
-    ARGOCD_DESTINATION_SERVER="$(destination_server_from_template "$WORK_DIR/config-repo/$CONFIG_TEMPLATE_PATH" || true)"
-  fi
-
-  if [[ "$CONFIG_EXISTS" == "false" && "$CONFIG_TEMPLATE_PATH" == "$CONFIG_PATH" ]]; then
-    echo "STATUS=ERROR"
-    echo "STATE=missing_first_deployment_template"
-    echo "NEXT_REQUIRED_INPUT=separate approved config template path"
-    echo "CONFIG_EXISTS=false"
-    echo "CONFIG_TEMPLATE_EXISTS=${CONFIG_TEMPLATE_EXISTS}"
-    exit 1
-  fi
-  if [[ "$CONFIG_TEMPLATE_EXISTS" != "true" ]]; then
-    echo "STATUS=ERROR"
-    echo "NEXT_REQUIRED_INPUT=config template path"
-    echo "CONFIG_TEMPLATE_EXISTS=false"
-    exit 1
-  fi
-  if [[ -z "$ARGOCD_DESTINATION_SERVER" ]]; then
-    echo "STATUS=ERROR"
-    echo "NEXT_REQUIRED_INPUT=Argo CD destination server"
-    exit 1
-  fi
-
-  echo "STATUS=OK"
-  echo "ACTION=preflight"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
-  echo "PROJECT_NAME=${PROJECT_NAME}"
-  echo "BRANCH=${BRANCH}"
-  echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
-  echo "PREVIOUS_VERSION=${PREVIOUS_VERSION}"
-  echo "VERSION=${VERSION}"
-  echo "VERSION_SOURCE=${VERSION_SOURCE}"
-  echo "JENKINS_JOB_EXISTS=${JENKINS_JOB_EXISTS}"
-  echo "JENKINS_PARAMETER_BRANCH=${JENKINS_PARAMETER_BRANCH}"
-  echo "JENKINS_PARAMETER_VERSION=${JENKINS_PARAMETER_VERSION}"
-  echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_PARAMETER_DISTRIBUTION_TYPE}"
-  echo "CONFIG_REPO_ACCESSIBLE=${CONFIG_REPO_ACCESSIBLE}"
-  echo "CONFIG_REPO_URL=${CONFIG_REPO_URL}"
-  echo "CONFIG_REPO_BRANCH=${CONFIG_REPO_BRANCH}"
-  echo "CHARTS_PATH=${CHARTS_PATH}"
-  echo "CONFIG_PATH=${CONFIG_PATH}"
-  echo "CONFIG_TEMPLATE_PATH=${CONFIG_TEMPLATE_PATH}"
-  echo "CONFIG_EXISTS=${CONFIG_EXISTS}"
-  echo "CONFIG_TEMPLATE_EXISTS=${CONFIG_TEMPLATE_EXISTS}"
-  echo "ARGOCD_SERVER=${ARGOCD_SERVER}"
-  echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}"
-  echo "ARGOCD_PROJECT=${ARGOCD_PROJECT}"
-  echo "ARGOCD_DESTINATION_SERVER=${ARGOCD_DESTINATION_SERVER}"
-  echo "ARGOCD_DESTINATION_NAMESPACE=${ARGOCD_DESTINATION_NAMESPACE}"
-  echo "ARGOCD_CLI_AVAILABLE=${ARGOCD_CLI_AVAILABLE}"
-  echo "ARGOCD_AUTHENTICATED=${ARGOCD_AUTHENTICATED}"
-  echo "ARGOCD_APP_EXISTS=${ARGOCD_APP_EXISTS}"
-  echo "DEPLOYMENT_MODE=${DEPLOYMENT_MODE}"
-  echo "MUTATIONS_PERFORMED=false"
-  exit 0
-fi
+VERSION_OUTPUT="$WORK_DIR/version.out"
+version_args=(
+  "$SCRIPT_DIR/version-resolver.sh"
+  --execution-environment "$EXECUTION_ENVIRONMENT"
+  --jenkins-url "$JENKINS_URL"
+  --project-name "$PROJECT_NAME"
+  --distribution-type "$DISTRIBUTION_TYPE"
+)
+[[ -n "$JOB_NAME" ]] && version_args+=(--job-name "$JOB_NAME")
+[[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
+run_and_capture "$VERSION_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${version_args[@]}" || exit 1
+DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
+VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
 
 BUILD_OUTPUT="$WORK_DIR/jenkins-build.out"
 build_args=(
@@ -956,7 +829,8 @@ build_args=(
 [[ -n "$TEMPLATE_JOB" ]] && build_args+=(--template-job "$TEMPLATE_JOB")
 [[ -n "$VERSION" ]] && build_args+=(--version "$VERSION")
 [[ "$DRY_RUN" == "true" ]] && build_args+=(--dry-run)
-run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
+CHILD_EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT"
+run_and_capture "$BUILD_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${build_args[@]}" || exit 1
 
 build_status="$(value_from_output STATUS "$BUILD_OUTPUT")"
 if [[ "$build_status" == "ERROR" ]]; then
@@ -979,7 +853,7 @@ case "$RESULT" in
   SUCCESS)
     ;;
   FAILURE|UNSTABLE|ABORTED)
-    bash "$SCRIPT_DIR/jenkins-analyze-failure.sh" --build-url "$BUILD_URL" --max-lines 400
+    env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/jenkins-analyze-failure.sh" --build-url "$BUILD_URL" --max-lines 400
     exit 1
     ;;
   *)
@@ -987,67 +861,92 @@ case "$RESULT" in
     ;;
 esac
 
-DEPLOY_LOOKUP_OUTPUT="$WORK_DIR/deployment-lookup.out"
-run_and_capture "$DEPLOY_LOOKUP_OUTPUT" bash "$SCRIPT_DIR/deployment-lookup.sh" \
+GITOPS_CHECK_OUTPUT="$WORK_DIR/gitops-check.out"
+run_and_capture "$GITOPS_CHECK_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/gitops-check.sh" \
+  --execution-environment "$EXECUTION_ENVIRONMENT" \
+  --project-name "$PROJECT_NAME" \
+  --environment "$ENVIRONMENT" \
   --config-repo-url "$CONFIG_REPO_URL" \
   --config-repo-branch "$CONFIG_REPO_BRANCH" \
+  --charts-path "$CHARTS_PATH" \
   --config-path "$CONFIG_PATH" \
+  --config-template-path "$CONFIG_TEMPLATE_PATH" || exit 1
+CONFIG_EXISTS="$(value_from_output CONFIG_EXISTS "$GITOPS_CHECK_OUTPUT")"
+CONFIG_TEMPLATE_EXISTS="$(value_from_output CONFIG_TEMPLATE_EXISTS "$GITOPS_CHECK_OUTPUT")"
+
+ARGO_CHECK_OUTPUT="$WORK_DIR/argocd-check.out"
+run_and_capture "$ARGO_CHECK_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/argocd-check.sh" \
+  --execution-environment "$EXECUTION_ENVIRONMENT" \
   --argocd-server "$ARGOCD_SERVER" \
-  --argocd-app-name "$ARGOCD_APP_NAME" \
-  --execution-environment "$EXECUTION_ENVIRONMENT" || exit 1
+  --argocd-app-name "$ARGOCD_APP_NAME" || exit 1
+ARGOCD_APP_EXISTS="$(value_from_output ARGOCD_APP_EXISTS "$ARGO_CHECK_OUTPUT")"
+existing_destination_server="$(value_from_output ARGOCD_DESTINATION_SERVER "$ARGO_CHECK_OUTPUT")"
+[[ -n "$existing_destination_server" ]] && ARGOCD_DESTINATION_SERVER="$existing_destination_server"
 
-FIRST_DEPLOYMENT="$(value_from_output FIRST_DEPLOYMENT "$DEPLOY_LOOKUP_OUTPUT")"
-CONFIG_EXISTS="$(value_from_output CONFIG_EXISTS "$DEPLOY_LOOKUP_OUTPUT")"
-ARGOCD_APP_EXISTS="$(value_from_output ARGOCD_APP_EXISTS "$DEPLOY_LOOKUP_OUTPUT")"
-
-clone_gitops_repo
-if [[ "$FIRST_DEPLOYMENT" == "true" ]]; then
-  if [[ "$CONFIG_TEMPLATE_PATH" == "$CONFIG_PATH" ]]; then
-    echo "STATUS=ERROR"
-    echo "STATE=missing_first_deployment_template"
-    echo "NEXT_REQUIRED_INPUT=separate approved config template path"
-    exit 1
-  fi
-  write_initial_config
-  ARGOCD_MODE="create"
-elif [[ "$CONFIG_EXISTS" == "true" && "$ARGOCD_APP_EXISTS" == "true" ]]; then
-  update_existing_config
-  ARGOCD_MODE="update"
-else
-  error_exit "Deployment state is inconsistent" "manual deployment state repair"
+if ! ARGOCD_MODE="$(deployment_mode_for_state "$CONFIG_EXISTS" "$ARGOCD_APP_EXISTS")"; then
+  echo "STATUS=ERROR"
+  echo "STATE=inconsistent"
+  echo "NEXT_REQUIRED_INPUT=manual deployment state repair"
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
 fi
 
-if [[ -z "$ARGOCD_DESTINATION_SERVER" && "$ARGOCD_MODE" == "update" ]]; then
-  ARGOCD_ARGS=(--server "$ARGOCD_SERVER")
-  if argocd "${ARGOCD_ARGS[@]}" app get "$ARGOCD_APP_NAME" -o json >"$WORK_DIR/argocd-existing.json" 2>"$WORK_DIR/argocd-existing.err"; then
-    ARGOCD_DESTINATION_SERVER="$(json_argocd_app_fields "$WORK_DIR/argocd-existing.json" | sed -n 's/^ARGOCD_EXISTING_DESTINATION_SERVER=//p')"
-  fi
+if [[ "$ARGOCD_MODE" == "create" && "$CONFIG_TEMPLATE_PATH" == "$CONFIG_PATH" ]]; then
+  echo "STATUS=ERROR"
+  echo "STATE=missing_first_deployment_template"
+  echo "NEXT_REQUIRED_INPUT=separate approved config template path"
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
 fi
-if [[ -z "$ARGOCD_DESTINATION_SERVER" && "$ARGOCD_MODE" == "create" ]]; then
-  ARGOCD_DESTINATION_SERVER="$(destination_server_from_template "$WORK_DIR/config-repo/$CONFIG_TEMPLATE_PATH" || true)"
+
+GITOPS_UPDATE_OUTPUT="$WORK_DIR/gitops-update.out"
+gitops_update_args=(
+  "$SCRIPT_DIR/gitops-update.sh"
+  --execution-environment "$EXECUTION_ENVIRONMENT"
+  --mode "$ARGOCD_MODE"
+  --project-name "$PROJECT_NAME"
+  --environment "$ENVIRONMENT"
+  --distribution-type "$DISTRIBUTION_TYPE"
+  --version "$VERSION"
+  --config-repo-url "$CONFIG_REPO_URL"
+  --config-repo-branch "$CONFIG_REPO_BRANCH"
+  --charts-path "$CHARTS_PATH"
+  --config-path "$CONFIG_PATH"
+  --config-template-path "$CONFIG_TEMPLATE_PATH"
+  --namespace "$ARGOCD_DESTINATION_NAMESPACE"
+  --argocd-app-name "$ARGOCD_APP_NAME"
+)
+[[ "$APPROVE_DEPLOYMENT" == "true" ]] && gitops_update_args+=(--approve)
+run_and_capture "$GITOPS_UPDATE_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${gitops_update_args[@]}" || exit 1
+if [[ "$APPROVE_DEPLOYMENT" != "true" ]]; then
+  exit 1
 fi
+
 if [[ -z "$ARGOCD_DESTINATION_SERVER" ]]; then
   error_exit "Missing Argo CD destination server" "Argo CD destination server"
 fi
 
-commit_and_push_config
-
-bash "$SCRIPT_DIR/argocd-deploy.sh" \
-  --mode "$ARGOCD_MODE" \
-  --argocd-server "$ARGOCD_SERVER" \
-  --argocd-app-name "$ARGOCD_APP_NAME" \
-  --argocd-project "$ARGOCD_PROJECT" \
-  --argocd-destination-server "$ARGOCD_DESTINATION_SERVER" \
-  --argocd-destination-namespace "$ARGOCD_DESTINATION_NAMESPACE" \
-  --config-repo-url "$CONFIG_REPO_URL" \
-  --config-repo-branch "$CONFIG_REPO_BRANCH" \
-  --config-path "$CONFIG_PATH" \
-  --timeout-seconds "$TIMEOUT_SECONDS" \
+argocd_sync_args=(
+  "$SCRIPT_DIR/argocd-sync.sh"
   --execution-environment "$EXECUTION_ENVIRONMENT"
+  --mode "$ARGOCD_MODE"
+  --argocd-server "$ARGOCD_SERVER"
+  --argocd-app-name "$ARGOCD_APP_NAME"
+  --argocd-project "$ARGOCD_PROJECT"
+  --repo-url "$CONFIG_REPO_URL"
+  --target-revision "$CONFIG_REPO_BRANCH"
+  --source-path "$CONFIG_PATH"
+  --destination-server "$ARGOCD_DESTINATION_SERVER"
+  --destination-namespace "$ARGOCD_DESTINATION_NAMESPACE"
+  --timeout-seconds "$TIMEOUT_SECONDS"
+)
+[[ "$APPROVE_DEPLOYMENT" == "true" ]] && argocd_sync_args+=(--approve)
+env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${argocd_sync_args[@]}"
 
 echo "STATUS=OK"
 echo "ACTION=delivered"
 echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
+echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT}"
 echo "PROJECT_NAME=${PROJECT_NAME}"
 echo "ENVIRONMENT=${ENVIRONMENT}"
 echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"

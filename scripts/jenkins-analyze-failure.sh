@@ -9,8 +9,9 @@ load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
   local perms
   perms="$(stat -f "%Lp" "$ENV_FILE" 2>/dev/null || stat -c "%a" "$ENV_FILE" 2>/dev/null || true)"
-  if [[ -n "$perms" && "$perms" != "600" ]]; then
+  if [[ -n "$perms" && "$perms" != "600" && "${SKILL_ENV_WARNING_EMITTED:-}" != "1" ]]; then
     echo "WARNING=.env should have permissions 600"
+    export SKILL_ENV_WARNING_EMITTED=1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue

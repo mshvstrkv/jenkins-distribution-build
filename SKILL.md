@@ -9,29 +9,57 @@ description: Use when the user wants to build a distributive through Jenkins and
 
 Run the full managed distributive workflow only through wrapper scripts.
 
-For a full user request such as "build a test distributive and deploy it to the test stand", the only supported entrypoint is:
+For new work, the preferred entrypoint is:
 
-`scripts/distribution-delivery.sh`
+`scripts/distribution`
 
-For a safe end-to-end validation without external mutations, pass:
+For a full user request such as "build a test distributive and deploy it to the test stand", execute:
 
-`--preflight`
+`scripts/distribution deploy`
+
+For a safe end-to-end validation without external mutations, use:
+
+`scripts/distribution preflight`
 
 The wrapper scripts are the source of truth for lookup, build, versioning, failure analysis, GitOps configuration, Argo CD operations, and deployment state decisions.
 
 Configuration and credentials are loaded by wrappers from the skill root `.env` file when present. The skill must not read or print `.env`.
 
+## CLI Policy
+
+The only preferred entrypoint is:
+
+`scripts/distribution`
+
+Legacy wrapper scripts exist for backward compatibility and implementation compatibility.
+
+Use these commands:
+- read-only validation: `scripts/distribution preflight`
+- full delivery: `scripts/distribution deploy`
+- Jenkins-only build: `scripts/distribution build`
+- version resolution: `scripts/distribution version`
+- failure analysis: `scripts/distribution analyze`
+- GitOps read-only check: `scripts/distribution gitops-check`
+- GitOps mutation stage: `scripts/distribution gitops-update`
+- Argo CD read-only check: `scripts/distribution argocd-check`
+- Argo CD sync stage: `scripts/distribution argocd-sync`
+
+The skill must not reproduce CLI business logic.
+
+The skill must not call `curl`, `git`, or `argocd` directly.
+
+The skill must pass arguments to the CLI and report machine output.
+
 ## Full Workflow
 
-`scripts/distribution-delivery.sh` owns this workflow:
+`scripts/distribution deploy` owns this workflow:
 
 Jenkins lookup
--> distribution type normalization
 -> version resolution
 -> Jenkins build with `--wait`
 -> Jenkins result handling
 -> failure analysis when build result is not `SUCCESS`
--> deployment lookup
+-> GitOps and Argo CD checks
 -> GitOps configuration create/update
 -> Argo CD application create/update
 -> Argo CD sync and health wait
@@ -73,7 +101,9 @@ Do not use `snapshot`.
 
 The agent must never calculate distributive versions.
 
-Version resolution belongs to `scripts/jenkins-build.sh`, normally invoked by `scripts/distribution-delivery.sh`.
+Version resolution belongs to `scripts/distribution version`, which delegates to `scripts/version-resolver.sh`.
+
+Full delivery invokes version resolution before Jenkins build and passes the resolved `--version` to the build wrapper.
 
 If the user provides an explicit version, pass it as:
 
@@ -95,9 +125,9 @@ Release versions:
 
 ## Execution Policy
 
-For full delivery requests, execute `scripts/distribution-delivery.sh` directly.
+For full delivery requests, execute `scripts/distribution deploy`.
 
-For preflight requests, execute `scripts/distribution-delivery.sh --preflight` directly.
+For preflight requests, execute `scripts/distribution preflight`.
 
 Real preflight, Jenkins build, GitOps, and Argo CD operations require:
 
@@ -159,7 +189,7 @@ Local validation is the default.
 
 Local validation uses:
 
-`scripts/distribution-delivery.sh --self-test`
+`scripts/distribution deploy --self-test`
 
 It checks only:
 - syntax
@@ -178,7 +208,7 @@ Local validation must not access:
 
 Corporate preflight uses:
 
-`scripts/distribution-delivery.sh --preflight --execution-environment corporate`
+`scripts/distribution preflight --execution-environment corporate`
 
 Corporate preflight is only for environments inside the corporate network and checks:
 - Jenkins
@@ -191,6 +221,49 @@ If wrappers return `STATE=corporate_environment_required` or `STATE=corporate_ne
 - `NEXT_REQUIRED_INPUT`
 
 Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, proxy inspection, certificate inspection, or hostname substitution.
+
+## Preflight Policy
+
+Preflight is read-only and must run through:
+
+`scripts/distribution preflight`
+
+The preflight wrapper collects independent Jenkins, GitOps, and Argo CD stage results.
+
+Preflight must not:
+- start a Jenkins build
+- create a Jenkins job
+- commit to GitOps
+- push to GitOps
+- create an Argo CD Application
+- sync Argo CD
+- modify the cluster
+
+Do not stop after the first failed stage if other read-only stages can still run.
+
+Do not interpret, duplicate, or reproduce preflight logic in the agent.
+
+Report the wrapper's full stage summary.
+
+`scripts/preflight.sh` and `scripts/distribution-delivery.sh --preflight` are compatibility paths. The preferred CLI path is `scripts/distribution preflight`.
+
+## Delivery Policy
+
+Full build and deployment runs only through:
+
+`scripts/distribution deploy`
+
+`scripts/distribution-delivery.sh` is the legacy delivery wrapper behind the CLI.
+
+The delivery wrapper must not contain duplicated preflight implementation.
+
+Delivery flow is:
+
+Jenkins build
+-> wait
+-> failure analysis or success
+-> GitOps update/create
+-> Argo CD create/update/sync
 
 ## Failure Policy
 
@@ -262,28 +335,11 @@ Before deployment-stage changes, wrappers print:
 
 Do not request confirmation for read-only checks.
 
-## Preflight Policy
+## Preflight Reporting
 
-Preflight must be read-only.
+Report `scripts/distribution preflight` machine output only.
 
-When the user requests a safe check of the full process, run:
-
-`scripts/distribution-delivery.sh --preflight`
-
-Preflight must not:
-- start a Jenkins build
-- create a Jenkins job
-- commit to GitOps
-- push to GitOps
-- create an Argo CD Application
-- sync Argo CD
-- modify the cluster
-
-Report preflight machine output only.
-
-If preflight returns `STATE=jenkins_parameter_mismatch`, ask only for Jenkins parameter mapping.
-
-If preflight returns `NEXT_REQUIRED_INPUT=config template path`, ask only for the approved config template path.
+If a stage returns `*_NEXT_REQUIRED_INPUT`, ask only for that exact missing input.
 
 ## Credential Policy
 
