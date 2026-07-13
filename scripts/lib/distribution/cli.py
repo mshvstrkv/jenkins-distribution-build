@@ -25,7 +25,7 @@ def main(argv: list[str] | None = None) -> int:
     mapping = {
         "preflight": "preflight.sh",
         "version": "version-resolver.sh",
-        "build": "jenkins-build.sh",
+        "build": "jenkins-build-flow.sh",
         "deploy": "distribution-delivery.sh",
         "analyze": "jenkins-analyze-failure.sh",
         "gitops-check": "gitops-check.sh",
@@ -44,4 +44,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

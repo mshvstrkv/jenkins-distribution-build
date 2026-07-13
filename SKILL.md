@@ -50,6 +50,25 @@ The skill must not call `curl`, `git`, or `argocd` directly.
 
 The skill must pass arguments to the CLI and report machine output.
 
+## Jenkins Build Policy
+
+`scripts/distribution build` runs the Jenkins-only orchestrated flow.
+
+It uses:
+- `scripts/jenkins-lookup.sh`
+- `scripts/version-resolver.sh`
+- `scripts/jenkins-build.sh --job-name <resolved> --skip-lookup`
+- `scripts/jenkins-analyze-failure.sh` when a completed Jenkins build is not `SUCCESS`
+
+It must not run:
+- GitOps checks
+- GitOps updates
+- Argo CD checks
+- Argo CD create/update/sync
+- Kubernetes operations
+
+`scripts/jenkins-build.sh` is a low-level compatibility wrapper. The skill should not use it directly unless the user explicitly asks for the low-level wrapper.
+
 ## Full Workflow
 
 `scripts/distribution deploy` owns this workflow:
