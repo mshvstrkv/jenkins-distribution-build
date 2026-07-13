@@ -45,6 +45,7 @@ Usage:
     [--skip-lookup] \
     [--dry-run] \
     [--wait] \
+    [--recovery-window-seconds <number>] \
     [--timeout-seconds <number>]
 
 Required arguments:
@@ -64,6 +65,7 @@ Optional arguments:
   --skip-lookup        Use the explicit --job-name without running Jenkins job lookup
   --dry-run            Print intended actions without changing Jenkins
   --wait               Wait until the queued build completes
+  --recovery-window-seconds  Completed build recovery window, default 3600
   --timeout-seconds    Wait timeout, default 1800
 
 Credentials are read only from:
@@ -73,6 +75,7 @@ EOF
 }
 
 emit_common() {
+  echo "STATE=${STATE:-}"
   echo "JENKINS_URL=${JENKINS_URL:-}"
   echo "PROJECT_NAME=${PROJECT_NAME:-}"
   echo "BRANCH=${BRANCH:-}"
@@ -81,6 +84,7 @@ emit_common() {
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
   echo "RESULT=${RESULT:-}"
+  echo "BUILD_TRIGGERED=${BUILD_TRIGGERED:-false}"
   echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE:-}"
   echo "VERSION=${VERSION:-}"
   echo "VERSION_SOURCE=${VERSION_SOURCE:-}"
@@ -92,6 +96,7 @@ emit_common() {
   echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_DISTRIBUTION_TYPE_PARAM:-}"
   echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
   echo "CHILD_EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "MUTATIONS_PERFORMED=${MUTATIONS_PERFORMED:-false}"
 }
 
 error_exit() {
@@ -229,6 +234,121 @@ for artifact in payload.get("artifacts") or []:
     path = artifact.get("relativePath")
     if path and base:
         print(urllib.parse.urljoin(base, "artifact/" + path))
+PY
+}
+
+json_recovery_match() {
+  local mode="$1"
+  local json_file="$2"
+  local root_url="$3"
+
+  local current_time_ms
+  current_time_ms="$(($(date +%s) * 1000))"
+
+  python3 - "$mode" "$json_file" "$root_url" "$JOB_NAME" "$JOB_URL" "$JENKINS_BRANCH_PARAM" "$BRANCH" "$JENKINS_VERSION_PARAM" "$VERSION" "$JENKINS_DISTRIBUTION_TYPE_PARAM" "$DISTRIBUTION_TYPE" "$RECOVERY_WINDOW_SECONDS" "$current_time_ms" <<'PY'
+import json
+import sys
+import urllib.parse
+
+(
+    mode,
+    json_file,
+    root_url,
+    job_name,
+    job_url,
+    branch_param,
+    branch,
+    version_param,
+    version,
+    distribution_type_param,
+    distribution_type,
+    recovery_window_seconds,
+    current_time_ms,
+) = sys.argv[1:]
+recovery_window_ms = int(recovery_window_seconds) * 1000
+current_time_ms = int(current_time_ms)
+
+try:
+    with open(json_file, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception:
+    sys.exit(1)
+
+def norm_url(value):
+    return (value or "").rstrip("/")
+
+def parameters_from_actions(actions):
+    values = {}
+    for action in actions or []:
+        for parameter in action.get("parameters") or []:
+            name = str(parameter.get("name") or "")
+            if name:
+                values[name] = str(parameter.get("value") or "")
+    return values
+
+def parameters_from_queue_text(text):
+    values = {}
+    for line in str(text or "").splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            values[name.strip()] = value.strip()
+    return values
+
+def matches_params(values):
+    return (
+        values.get(branch_param) == branch
+        and values.get(version_param) == version
+        and values.get(distribution_type_param) == distribution_type
+    )
+
+if mode == "queue":
+    for item in payload.get("items") or []:
+        task = item.get("task") or {}
+        task_url = norm_url(task.get("url"))
+        task_name = str(task.get("name") or "")
+        if task_url and task_url != norm_url(job_url):
+            continue
+        if not task_url and task_name != job_name:
+            continue
+        values = parameters_from_actions(item.get("actions"))
+        values.update(parameters_from_queue_text(item.get("params")))
+        if not matches_params(values):
+            continue
+        queue_url = item.get("url") or ""
+        if not queue_url and item.get("id") is not None:
+            queue_url = urllib.parse.urljoin(root_url.rstrip("/") + "/", f"queue/item/{item['id']}/")
+        executable = item.get("executable") or {}
+        print(f"QUEUE_URL={queue_url.rstrip('/')}")
+        print(f"BUILD_URL={norm_url(executable.get('url'))}")
+        sys.exit(0)
+    sys.exit(1)
+
+if mode == "builds":
+    for build in payload.get("builds") or []:
+        values = parameters_from_actions(build.get("actions"))
+        if not matches_params(values):
+            continue
+        building = bool(build.get("building"))
+        result = build.get("result")
+        if result == "ABORTED":
+            continue
+        if not building:
+            timestamp = build.get("timestamp")
+            if timestamp is None:
+                continue
+            try:
+                timestamp = int(timestamp)
+            except (TypeError, ValueError):
+                continue
+            if current_time_ms - timestamp > recovery_window_ms:
+                continue
+        print("QUEUE_URL=")
+        print(f"BUILD_URL={norm_url(build.get('url'))}")
+        print(f"RESULT={'' if result is None else result}")
+        sys.exit(0)
+    sys.exit(1)
+
+sys.exit(2)
 PY
 }
 
@@ -417,6 +537,125 @@ header_location() {
   sed -n 's/^[Ll]ocation:[[:space:]]*\(.*\)[[:space:]]*$/\1/p' "$headers_file" | tail -n 1 | tr -d '\r'
 }
 
+absolute_url() {
+  local base="$1"
+  local location="$2"
+  python3 - "$base" "$location" <<'PY'
+import sys
+import urllib.parse
+
+print(urllib.parse.urljoin(sys.argv[1], sys.argv[2]))
+PY
+}
+
+url_host() {
+  local url="$1"
+  python3 - "$url" <<'PY'
+import sys
+import urllib.parse
+
+print(urllib.parse.urlparse(sys.argv[1]).hostname or "")
+PY
+}
+
+approved_jenkins_redirect_url() {
+  local url="$1"
+  local host
+  host="$(url_host "$url")"
+  case "$host" in
+    aipay.ci.jenkins.sberbank.ru|ci.jenkins.sberbank.ru)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+build_url_from_api_url() {
+  local url="$1"
+  case "$url" in
+    */api/json) printf '%s' "${url%/api/json}" ;;
+    *) printf '%s' "${url%/}" ;;
+  esac
+}
+
+jenkins_root_url() {
+  local url="$1"
+  python3 - "$url" <<'PY'
+import sys
+import urllib.parse
+
+parsed = urllib.parse.urlparse(sys.argv[1])
+print(f"{parsed.scheme}://{parsed.netloc}")
+PY
+}
+
+jenkins_status_unavailable_exit() {
+  STATE="${1:-jenkins_build_status_unavailable}"
+  NEXT_REQUIRED_INPUT="${2:-Jenkins build status access}"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Failed to read Jenkins build status"
+  emit_common
+  exit 1
+}
+
+build_wait_timeout_exit() {
+  STATE="build_wait_timeout"
+  NEXT_REQUIRED_INPUT="${1:-more time or Jenkins build inspection}"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Timed out waiting for Jenkins build result"
+  emit_common
+  exit 1
+}
+
+curl_get_jenkins_api_follow_redirect() {
+  local current_url="$1"
+  local update_build_url="${2:-false}"
+  local status location next_url redirect_count=0
+
+  while true; do
+    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+      --request GET \
+      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+      "$current_url")"
+
+    case "$status" in
+      301|302|303|307|308)
+        location="$(header_location "$HEADERS_FILE")"
+        if [[ -z "$location" ]]; then
+          printf '562'
+          return 0
+        fi
+        next_url="$(absolute_url "$current_url" "$location")"
+        if ! approved_jenkins_redirect_url "$next_url"; then
+          printf '561'
+          return 0
+        fi
+        if [[ "$update_build_url" == "true" ]]; then
+          BUILD_URL="$(build_url_from_api_url "$next_url")"
+          case "$next_url" in
+            */api/json) ;;
+            *) next_url="${BUILD_URL}/api/json" ;;
+          esac
+        fi
+        current_url="$next_url"
+        redirect_count=$((redirect_count + 1))
+        if (( redirect_count > 5 )); then
+          printf '562'
+          return 0
+        fi
+        ;;
+      *)
+        printf '%s' "$status"
+        return 0
+        ;;
+    esac
+  done
+}
+
 job_url_for() {
   local name="$1"
   local encoded
@@ -558,6 +797,68 @@ create_job_from_template() {
   esac
 }
 
+recover_existing_build() {
+  [[ "$DRY_RUN" != "true" ]] || return 1
+  [[ -n "$JOB_NAME" && -n "$JOB_URL" && -n "$BRANCH" && -n "$VERSION" ]] || return 1
+
+  local root_url status recovery_output queue_url build_url recovered_result
+  root_url="$(jenkins_root_url "$JENKINS_URL")"
+
+  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    --globoff \
+    --request GET \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${root_url}/queue/api/json?tree=items[id,url,params,task[name,url],actions[parameters[name,value]],executable[url]]")"
+  case "$status" in
+    200)
+      if recovery_output="$(json_recovery_match queue "$BODY_FILE" "$root_url" 2>/dev/null)"; then
+        queue_url="$(sed -n 's/^QUEUE_URL=//p' <<<"$recovery_output" | tail -n 1)"
+        build_url="$(sed -n 's/^BUILD_URL=//p' <<<"$recovery_output" | tail -n 1)"
+        QUEUE_URL="$queue_url"
+        BUILD_URL="$build_url"
+        BUILD_TRIGGERED=true
+        ACTION="recovered"
+        MUTATIONS_PERFORMED=false
+        return 0
+      fi
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while checking existing queue items: HTTP ${status}" "valid Jenkins credentials"
+      ;;
+    *)
+      ;;
+  esac
+
+  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    --globoff \
+    --request GET \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/api/json?tree=builds[number,url,result,building,timestamp,actions[parameters[name,value]]]")"
+  case "$status" in
+    200)
+      if recovery_output="$(json_recovery_match builds "$BODY_FILE" "$root_url" 2>/dev/null)"; then
+        queue_url="$(sed -n 's/^QUEUE_URL=//p' <<<"$recovery_output" | tail -n 1)"
+        build_url="$(sed -n 's/^BUILD_URL=//p' <<<"$recovery_output" | tail -n 1)"
+        recovered_result="$(sed -n 's/^RESULT=//p' <<<"$recovery_output" | tail -n 1)"
+        QUEUE_URL="$queue_url"
+        BUILD_URL="$build_url"
+        RESULT="$recovered_result"
+        BUILD_TRIGGERED=true
+        ACTION="recovered"
+        MUTATIONS_PERFORMED=false
+        return 0
+      fi
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while checking existing builds: HTTP ${status}" "valid Jenkins credentials"
+      ;;
+    *)
+      ;;
+  esac
+
+  return 1
+}
+
 trigger_build() {
   if [[ "$DRY_RUN" == "true" ]]; then
     QUEUE_URL=""
@@ -607,6 +908,9 @@ trigger_build() {
   case "$status" in
     200|201|202|302)
       QUEUE_URL="$(header_location "$HEADERS_FILE")"
+      BUILD_TRIGGERED=true
+      MUTATIONS_PERFORMED=true
+      ACTION="build"
       ;;
     401|403)
       error_exit "Jenkins access denied while triggering build: HTTP ${status}" "valid Jenkins credentials"
@@ -621,51 +925,399 @@ run_version_self_tests() {
   bash "$SCRIPT_DIR/version-resolver.sh" --self-test
 }
 
+run_build_wait_self_tests() {
+  local tmp bin mock_curl mock_sleep mock_date
+  tmp="$(mktemp -d)"
+  bin="$tmp/bin"
+  mkdir -p "$bin"
+  mock_curl="$bin/curl"
+  mock_sleep="$bin/sleep"
+  mock_date="$bin/date"
+
+  cat >"$mock_sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  cat >"$mock_date" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "+%s" ]]; then
+  count_file="${JENKINS_BUILD_WAIT_TEST_DIR}/date-count"
+  count=0
+  [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+  count=$((count + 1))
+  echo "$count" >"$count_file"
+  if [[ "${JENKINS_BUILD_WAIT_SCENARIO}" == "timeout" ]]; then
+    if (( count <= 3 )); then
+      echo 0
+    else
+      echo 20
+    fi
+  else
+    echo "$count"
+  fi
+else
+  /bin/date "$@"
+fi
+EOF
+
+  cat >"$mock_curl" <<'EOF'
+#!/usr/bin/env bash
+output=""
+headers=""
+method="GET"
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --dump-header) headers="$2"; shift 2 ;;
+    --write-out) shift 2 ;;
+    --request) method="$2"; shift 2 ;;
+    --user) shift 2 ;;
+    --header) shift 2 ;;
+    --data-binary) shift 2 ;;
+    --silent|--show-error|--fail|--globoff) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+: >"$headers"
+mkdir -p "$(dirname "$output")"
+
+if [[ "$url" == *"/crumbIssuer/api/json" ]]; then
+  printf '{}\n' >"$output"
+  printf '404'
+  exit 0
+fi
+
+if [[ "$url" == *"/queue/api/json?tree="* ]]; then
+  case "$JENKINS_BUILD_WAIT_SCENARIO" in
+    recovery-queue)
+      printf '{"items":[{"id":1,"url":"https://aipay.ci.jenkins.sberbank.ru/queue/item/1/","task":{"name":"test-project-build","url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/"},"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    *)
+      printf '{"items":[]}\n' >"$output"
+      ;;
+  esac
+  printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/api/json?tree=builds"* ]]; then
+  case "$JENKINS_BUILD_WAIT_SCENARIO" in
+    recovery-running)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":true,"result":null,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-recent-success)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-old-success)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":-999999999,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-recent-failure)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"FAILURE","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-old-failure)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"FAILURE","timestamp":-999999999,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-aborted)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"ABORTED","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      ;;
+    recovery-dtype-mismatch)
+      printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":true,"result":null,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"release"}]}]}]}\n' >"$output"
+      ;;
+    repeated-restart)
+      if [[ -f "${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-count" ]]; then
+        printf '{"builds":[{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/","building":false,"result":"SUCCESS","timestamp":0,"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      else
+        printf '{"builds":[]}\n' >"$output"
+      fi
+      ;;
+    *)
+      printf '{"builds":[]}\n' >"$output"
+      ;;
+  esac
+  printf '200'
+  exit 0
+fi
+
+if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
+  count_file="${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-count"
+  count=0
+  [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+  count=$((count + 1))
+  echo "$count" >"$count_file"
+  printf 'Location: https://aipay.ci.jenkins.sberbank.ru/queue/item/1/\r\n' >"$headers"
+  printf '{}\n' >"$output"
+  printf '201'
+  exit 0
+fi
+
+if [[ "$url" == *"/queue/item/1/api/json" ]]; then
+  printf '{"executable":{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/"}}\n' >"$output"
+  printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json" ]]; then
+  count_file="${JENKINS_BUILD_WAIT_TEST_DIR}/build-count"
+  count=0
+  [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+  count=$((count + 1))
+  echo "$count" >"$count_file"
+  case "$JENKINS_BUILD_WAIT_SCENARIO" in
+    redirect-success)
+      if [[ "$count" == "1" ]]; then
+        printf 'Location: https://ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json\r\n' >"$headers"
+        printf '{}\n' >"$output"
+        printf '302'
+      elif [[ "$count" == "2" ]]; then
+        printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+        printf '200'
+      else
+        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        printf '200'
+      fi
+      ;;
+    redirect-failure)
+      if [[ "$count" == "1" ]]; then
+        printf 'Location: https://ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json\r\n' >"$headers"
+        printf '{}\n' >"$output"
+        printf '302'
+      else
+        printf '{"building":false,"result":"FAILURE","artifacts":[]}\n' >"$output"
+        printf '200'
+      fi
+      ;;
+    transient-404)
+      if [[ "$count" -lt "3" ]]; then
+        printf '{}\n' >"$output"
+        printf '404'
+      else
+        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        printf '200'
+      fi
+      ;;
+    timeout)
+      printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+      printf '200'
+      ;;
+    redirect-rejected)
+      printf 'Location: https://not-jenkins.example.org/job/test/44/api/json\r\n' >"$headers"
+      printf '{}\n' >"$output"
+      printf '302'
+      ;;
+    recovery-queue|recovery-running)
+      if [[ "$count" == "1" ]]; then
+        printf '{"building":true,"result":null,"artifacts":[]}\n' >"$output"
+        printf '200'
+      else
+        printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+        printf '200'
+      fi
+      ;;
+    recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
+      printf '{"building":false,"result":"SUCCESS","artifacts":[]}\n' >"$output"
+      printf '200'
+      ;;
+    recovery-recent-failure|recovery-old-failure)
+      printf '{"building":false,"result":"FAILURE","artifacts":[]}\n' >"$output"
+      printf '200'
+      ;;
+  esac
+  exit 0
+fi
+
+printf '{}\n' >"$output"
+printf '500'
+EOF
+
+  chmod +x "$mock_curl" "$mock_sleep" "$mock_date"
+
+  run_case() {
+    local scenario="$1"
+    local expected_status="$2"
+    local expected_pattern="$3"
+    local timeout_seconds="${4:-100}"
+    local expected_trigger_count="${5:-1}"
+    local case_dir output rc trigger_count
+    case_dir="$tmp/$scenario"
+    mkdir -p "$case_dir"
+    set +e
+    output="$(
+      PATH="$bin:$PATH" \
+      JENKINS_BUILD_WAIT_TEST_DIR="$case_dir" \
+      JENKINS_BUILD_WAIT_SCENARIO="$scenario" \
+      JENKINS_USER=dummy \
+      JENKINS_TOKEN=dummy \
+      bash "$0" \
+        --execution-environment corporate \
+        --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
+        --project-name test-project \
+        --branch develop \
+        --job-name test-project-build \
+        --skip-lookup \
+        --distribution-type ift \
+        --version IFT-0.0.1 \
+        --wait \
+        --timeout-seconds "$timeout_seconds"
+    )"
+    rc=$?
+    set -e
+    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} expected success"
+      exit 1
+    fi
+    if [[ "$expected_status" == "failure" && $rc -eq 0 ]]; then
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} expected failure"
+      exit 1
+    fi
+    grep -q "$expected_pattern" <<<"$output" || {
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} missing ${expected_pattern}"
+      exit 1
+    }
+    grep -q "BUILD_TRIGGERED=true" <<<"$output" || {
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} missing BUILD_TRIGGERED=true"
+      exit 1
+    }
+    trigger_count="$(cat "$case_dir/trigger-count" 2>/dev/null || echo 0)"
+    [[ "$trigger_count" == "$expected_trigger_count" ]] || {
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} trigger count ${trigger_count}"
+      exit 1
+    }
+  }
+
+  run_restart_case() {
+    local case_dir output1 output2 rc trigger_count
+    case_dir="$tmp/repeated-restart"
+    mkdir -p "$case_dir"
+    set +e
+    output1="$(
+      PATH="$bin:$PATH" \
+      JENKINS_BUILD_WAIT_TEST_DIR="$case_dir" \
+      JENKINS_BUILD_WAIT_SCENARIO="repeated-restart" \
+      JENKINS_USER=dummy \
+      JENKINS_TOKEN=dummy \
+      bash "$0" \
+        --execution-environment corporate \
+        --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
+        --project-name test-project \
+        --branch develop \
+        --job-name test-project-build \
+        --skip-lookup \
+        --distribution-type ift \
+        --version IFT-0.0.1 \
+        --wait \
+        --timeout-seconds 100
+    )"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || { printf '%s\n' "$output1"; echo "FAIL repeated-restart first run"; exit 1; }
+
+    set +e
+    output2="$(
+      PATH="$bin:$PATH" \
+      JENKINS_BUILD_WAIT_TEST_DIR="$case_dir" \
+      JENKINS_BUILD_WAIT_SCENARIO="repeated-restart" \
+      JENKINS_USER=dummy \
+      JENKINS_TOKEN=dummy \
+      bash "$0" \
+        --execution-environment corporate \
+        --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
+        --project-name test-project \
+        --branch develop \
+        --job-name test-project-build \
+        --skip-lookup \
+        --distribution-type ift \
+        --version IFT-0.0.1 \
+        --wait \
+        --timeout-seconds 100
+    )"
+    rc=$?
+    set -e
+    [[ $rc -eq 0 ]] || { printf '%s\n' "$output2"; echo "FAIL repeated-restart second run"; exit 1; }
+    grep -q "ACTION=recovered" <<<"$output2" || { printf '%s\n' "$output2"; echo "FAIL repeated-restart not recovered"; exit 1; }
+    trigger_count="$(cat "$case_dir/trigger-count" 2>/dev/null || echo 0)"
+    [[ "$trigger_count" == "1" ]] || {
+      printf '%s\n%s\n' "$output1" "$output2"
+      echo "FAIL repeated-restart trigger count ${trigger_count}"
+      exit 1
+    }
+  }
+
+  run_case redirect-success success "RESULT=SUCCESS"
+  run_case redirect-failure success "RESULT=FAILURE"
+  run_case transient-404 success "RESULT=SUCCESS"
+  run_case timeout failure "STATE=build_wait_timeout" 1
+  run_case redirect-rejected failure "STATE=jenkins_redirect_rejected"
+  run_case recovery-queue success "ACTION=recovered" 100 0
+  run_case recovery-running success "ACTION=recovered" 100 0
+  run_case recovery-recent-success success "ACTION=recovered" 100 0
+  run_case recovery-old-success success "RESULT=SUCCESS" 100 1
+  run_case recovery-recent-failure success "ACTION=recovered" 100 0
+  run_case recovery-old-failure success "RESULT=FAILURE" 100 1
+  run_case recovery-aborted success "RESULT=SUCCESS" 100 1
+  run_case recovery-dtype-mismatch success "RESULT=SUCCESS" 100 1
+  run_case recovery-not-found success "RESULT=SUCCESS" 100 1
+  run_restart_case
+  rm -rf "$tmp"
+  echo "JENKINS_BUILD_WAIT_SELF_TESTS=OK"
+}
+
 wait_for_build() {
   [[ "$WAIT" == "true" && "$DRY_RUN" != "true" ]] || return 0
-  [[ -n "$QUEUE_URL" ]] || error_exit "Build was triggered but Jenkins did not return queue URL" "queue URL"
+  [[ -n "$QUEUE_URL" || -n "$BUILD_URL" ]] || error_exit "Build was triggered but Jenkins did not return queue or build URL" "queue or build URL"
 
   local start now status executable_url result
   start="$(date +%s)"
 
+  if [[ -z "$BUILD_URL" ]]; then
+    while true; do
+      now="$(date +%s)"
+      if (( now - start > TIMEOUT_SECONDS )); then
+        build_wait_timeout_exit "more time or Jenkins queue inspection"
+      fi
+
+      status="$(curl_get_jenkins_api_follow_redirect "${QUEUE_URL%/}/api/json" false)"
+
+      case "$status" in
+        200)
+          executable_url="$(json_field "executable.url" "$BODY_FILE" || true)"
+          if [[ -n "$executable_url" ]]; then
+            BUILD_URL="${executable_url%/}"
+            break
+          fi
+          ;;
+        401|403)
+          error_exit "Jenkins access denied while reading queue item: HTTP ${status}" "valid Jenkins credentials"
+          ;;
+        561)
+          jenkins_status_unavailable_exit "jenkins_redirect_rejected" "approved Jenkins redirect host"
+          ;;
+        562)
+          jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins queue access"
+          ;;
+        *)
+          jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins queue access"
+          ;;
+      esac
+
+      sleep 10
+    done
+  fi
+
   while true; do
     now="$(date +%s)"
     if (( now - start > TIMEOUT_SECONDS )); then
-      error_exit "Timed out waiting for Jenkins queue item. Queue URL: ${QUEUE_URL}" "more time or Jenkins queue inspection"
+      build_wait_timeout_exit "more time or Jenkins build inspection"
     fi
 
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "${QUEUE_URL%/}/api/json")"
-
-    case "$status" in
-      200)
-        executable_url="$(json_field "executable.url" "$BODY_FILE" || true)"
-        if [[ -n "$executable_url" ]]; then
-          BUILD_URL="${executable_url%/}"
-          break
-        fi
-        ;;
-      401|403)
-        error_exit "Jenkins access denied while reading queue item: HTTP ${status}" "valid Jenkins credentials"
-        ;;
-      *)
-        error_exit "Unexpected Jenkins response while reading queue item: HTTP ${status}" "Jenkins queue access"
-        ;;
-    esac
-
-    sleep 10
-  done
-
-  while true; do
-    now="$(date +%s)"
-    if (( now - start > TIMEOUT_SECONDS )); then
-      error_exit "Timed out waiting for Jenkins build. Build URL: ${BUILD_URL}" "more time or Jenkins build inspection"
-    fi
-
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "${BUILD_URL}/api/json")"
+    status="$(curl_get_jenkins_api_follow_redirect "${BUILD_URL}/api/json" true)"
 
     case "$status" in
       200)
@@ -676,11 +1328,19 @@ wait_for_build() {
           return 0
         fi
         ;;
+      404)
+        ;;
       401|403)
         error_exit "Jenkins access denied while reading build result: HTTP ${status}" "valid Jenkins credentials"
         ;;
+      561)
+        jenkins_status_unavailable_exit "jenkins_redirect_rejected" "approved Jenkins redirect host"
+        ;;
+      562)
+        jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins build status access"
+        ;;
       *)
-        error_exit "Unexpected Jenkins response while reading build result: HTTP ${status}" "Jenkins build access"
+        jenkins_status_unavailable_exit "jenkins_build_status_unavailable" "Jenkins build status access"
         ;;
     esac
 
@@ -706,6 +1366,7 @@ SKIP_LOOKUP=false
 DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
+RECOVERY_WINDOW_SECONDS=3600
 EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 ACTION=""
 JOB_NAME=""
@@ -713,6 +1374,9 @@ JOB_URL=""
 QUEUE_URL=""
 BUILD_URL=""
 RESULT=""
+STATE=""
+BUILD_TRIGGERED=false
+MUTATIONS_PERFORMED=false
 NEXT_REQUIRED_INPUT=""
 ARTIFACT_URLS=""
 CHECKED_JOB_NAMES=()
@@ -724,6 +1388,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test-versions)
       run_version_self_tests
+      exit 0
+      ;;
+    --self-test-build-wait)
+      run_build_wait_self_tests
       exit 0
       ;;
     --resolve-version-only)
@@ -802,6 +1470,11 @@ while [[ $# -gt 0 ]]; do
       TIMEOUT_SECONDS="$2"
       shift 2
       ;;
+    --recovery-window-seconds)
+      require_value "$1" "${2:-}"
+      RECOVERY_WINDOW_SECONDS="$2"
+      shift 2
+      ;;
     --execution-environment)
       require_value "$1" "${2:-}"
       EXECUTION_ENVIRONMENT="$2"
@@ -825,6 +1498,7 @@ case "$EXECUTION_ENVIRONMENT" in
   *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
 esac
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
+[[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--recovery-window-seconds must be a number" "recovery window seconds"
 if [[ "$SKIP_LOOKUP" == "true" && -z "$JOB_NAME_ARG" ]]; then
   error_exit "--skip-lookup requires --job-name" "job name"
 fi
@@ -879,7 +1553,9 @@ else
     emit_common
     exit 0
   fi
-  trigger_build
+  if ! recover_existing_build; then
+    trigger_build
+  fi
   wait_for_build
 fi
 
