@@ -1,9 +1,122 @@
 ---
 name: jenkins-distribution-build
-description: Use when the user wants to build a distributive through Jenkins and optionally deliver it to a test or release environment through GitOps and Argo CD wrappers.
+description: >
+  Use immediately whenever the user asks to build a new project version,
+  build a distributive, run a Jenkins build, publish or deploy a version,
+  or install an application on a test/release stand.
+  Russian triggers include: "собери новую версию", "собери дистрибутив",
+  "собери через Jenkins", "поставь на тестовый стенд",
+  "задеплой на тест", "выложи новую версию", "собери релиз".
+  This skill must be loaded before inspecting pom.xml, modules, Jenkinsfiles,
+  README, repository scripts, or attempting Maven/Gradle/Docker builds.
 ---
 
 # Jenkins Distribution Build Skill
+
+## Immediate Activation Policy
+
+Load and apply this skill immediately when the user asks to:
+
+- build a new version
+- build a distributive
+- run a Jenkins build
+- deploy or install a version on a test stand
+- deploy or install a release
+- build and deploy in one request
+
+These requests do not need to contain the word "Jenkins".
+
+Russian examples:
+
+- собери новую версию текущего проекта
+- собери дистрибутив
+- собери и поставь на тестовый стенд
+- задеплой новую версию на тест
+- собери релиз
+- запусти сборку
+
+Do not inspect the repository before loading and applying this skill.
+
+## User Intent Mapping
+
+Map user intent directly to the wrapper CLI:
+
+- "собери новую версию" -> `scripts/distribution build`
+- "собери дистрибутив" -> `scripts/distribution build`
+- "собери и поставь на тестовый стенд" -> `scripts/distribution deploy --approve-deployment`
+- "поставь существующую версию на тест" -> deployment flow without inventing a new build, if the CLI supports that mode; otherwise report the exact wrapper error
+- "собери релиз" -> pass `--distribution-type release`
+- "тестовая версия" or "тестовый стенд" -> pass `--distribution-type ift`
+
+If the user asks for build plus deploy, do not ask separately whether deployment is needed. The original request is the deployment confirmation.
+
+## First Executable Action Policy
+
+After loading this skill, the first executable command must be one of:
+
+- `scripts/distribution build`
+- `scripts/distribution deploy`
+- `scripts/distribution preflight`
+
+Choose the command based only on the user request.
+
+The wrapper path must be resolved relative to the skill `<base_dir>`, not relative to the current application repository.
+
+Before the first wrapper invocation, the agent must not:
+
+- read `pom.xml`
+- read `distributive/pom.xml`
+- read `assembly/*`
+- glob or read `Jenkinsfile`
+- glob or inspect repository `scripts/*`
+- search for Maven wrapper
+- run Maven, Gradle, or Docker
+- create task files, plan files, or todo lists
+- check whether `scripts/distribution` exists inside the application repository
+- read implementation wrapper files
+- independently determine corporate network availability
+
+## Skill Path Policy
+
+`scripts/distribution` belongs to the skill directory.
+
+It is not expected to exist in the current application repository.
+
+Resolve it relative to skill `<base_dir>` and execute it from there while preserving the current project directory as the project context.
+
+Never search the application repository for this wrapper.
+
+## Regression Examples
+
+Example A:
+
+User:
+"собери новую версию текущего проекта"
+
+Expected first executable action:
+`scripts/distribution build ... --wait`
+
+Forbidden:
+reading `pom.xml` or running Maven.
+
+Example B:
+
+User:
+"собери новую версию и поставь на тестовый стенд"
+
+Expected first executable action:
+`scripts/distribution deploy ... --distribution-type ift --approve-deployment`
+
+Forbidden:
+repository exploration before wrapper execution.
+
+Example C:
+
+User:
+"собери релизный дистрибутив"
+
+Expected first executable action:
+`scripts/distribution build ... --distribution-type release --wait`
 
 ## Goal
 
@@ -81,6 +194,22 @@ The agent must execute exactly one CLI command and report its final machine outp
 If the user says "проверь через 10 минут", do not interpret it as a recovery-window value. It means wait before checking status, not change `--recovery-window-seconds`.
 
 Do not create `.gigacode/plans/*` for a simple build request.
+
+For a request such as:
+
+"собери новую версию текущего проекта и поставь ее на тестовый стенд"
+
+execute the deploy flow immediately if defaults and wrapper-loaded `.env` allow the wrapper to resolve parameters.
+
+Do not ask:
+- where the wrapper is
+- whether `scripts/` exists in the project
+- whether the environment is corporate, if the user already stated it
+- for Jenkins URL, if wrappers can load it from skill `.env`
+- for project name, if wrappers can use the current project context
+- for version
+- for job name
+- for deployment confirmation
 
 ## Jenkins Build Policy
 
@@ -233,6 +362,16 @@ Do not:
 - search for corporate access workarounds
 
 Never automatically infer `corporate` mode from DNS, TLS, or host reachability.
+
+The agent must not claim it is outside the corporate network unless wrapper output proves that.
+
+If the user states that execution is inside the corporate environment, pass:
+
+`--execution-environment corporate`
+
+Do not run custom network checks.
+
+Do not ask again whether the environment is corporate.
 
 ## Validation Policy
 
