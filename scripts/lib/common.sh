@@ -47,7 +47,6 @@ error_exit() {
   echo "ACTION=blocked"
   echo "REASON=$1"
   echo "NEXT_REQUIRED_INPUT=${2:-}"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
   echo "MUTATIONS_PERFORMED=false"
   exit 1
 }
@@ -62,7 +61,7 @@ sanitize_technical_reason() {
   sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
 }
 
-is_corporate_network_error() {
+is_network_error() {
   case "$1" in
     *"Could not resolve host"*|*"Could not resolve hostname"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*|*"Unavailable"*|*"connection error"*)
       return 0
@@ -71,16 +70,46 @@ is_corporate_network_error() {
   esac
 }
 
-corporate_environment_required_exit() {
+jenkins_unreachable_exit() {
+  local technical_reason="${1:-}"
   echo "STATUS=ERROR"
   echo "ACTION=blocked"
-  echo "PREFLIGHT_RESULT=NOT_RUN"
-  echo "STATE=corporate_environment_required"
-  echo "REASON=This operation requires corporate network access"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
+  echo "STATE=jenkins_unreachable"
+  echo "REASON=Unable to connect to Jenkins"
+  [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
+  echo "NEXT_REQUIRED_INPUT=Jenkins access"
   echo "MUTATIONS_PERFORMED=false"
   exit 1
+}
+
+resolve_jenkins_url() {
+  if [[ -z "${JENKINS_URL:-}" ]]; then
+    JENKINS_URL="${JENKINS_URL:-}"
+  fi
+  [[ -n "${JENKINS_URL:-}" ]] || error_exit "Missing Jenkins URL" "JENKINS_URL"
+  JENKINS_URL="${JENKINS_URL%/}"
+}
+
+resolve_project_name() {
+  if [[ -n "${PROJECT_NAME:-}" ]]; then
+    return 0
+  fi
+  local git_root
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$git_root" ]]; then
+    PROJECT_NAME="$(basename "$git_root")"
+    return 0
+  fi
+  PROJECT_NAME="$(basename "$(pwd)")"
+  [[ -n "$PROJECT_NAME" && "$PROJECT_NAME" != "/" && "$PROJECT_NAME" != "." ]] || error_exit "Missing project name" "project name"
+}
+
+resolve_branch() {
+  if [[ -n "${BRANCH:-}" ]]; then
+    return 0
+  fi
+  BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
 }
 
 normalize_distribution_type() {

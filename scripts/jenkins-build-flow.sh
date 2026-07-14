@@ -13,10 +13,9 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/jenkins-build-flow.sh \
-    --execution-environment <local|corporate> \
-    --jenkins-url <url> \
-    --project-name <name> \
-    --branch <branch> \
+    [--jenkins-url <url>] \
+    [--project-name <name>] \
+    [--branch <branch>] \
     --distribution-type <ift|release|test|testing|prod|production> \
     [--job-name <exact-job-name>] \
     [--version <explicit-version>] \
@@ -153,7 +152,6 @@ EOF
     JENKINS_USER=dummy \
     JENKINS_TOKEN=dummy \
     bash "$0" \
-      --execution-environment corporate \
       --jenkins-url "https://example.invalid/job/folder" \
       --project-name test-project \
       --branch develop \
@@ -176,9 +174,7 @@ EOF
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
-EXECUTION_ENVIRONMENT_CLI=""
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 BRANCH=""
 JOB_NAME_ARG=""
@@ -195,7 +191,6 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_flow_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT_CLI="$2"; shift 2 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
@@ -214,16 +209,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$EXECUTION_ENVIRONMENT_CLI" ]]; then
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT_CLI"
-fi
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) flow_error "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
-[[ -n "$JENKINS_URL" ]] || flow_error "Missing required argument: --jenkins-url" "Jenkins URL"
-[[ -n "$PROJECT_NAME" ]] || flow_error "Missing required argument: --project-name" "project name"
-[[ -n "$BRANCH" ]] || flow_error "Missing required argument: --branch" "branch"
+resolve_jenkins_url
+resolve_project_name
+resolve_branch
 [[ -n "$DISTRIBUTION_TYPE" ]] || flow_error "Missing required argument: --distribution-type" "distribution type"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || flow_error "--timeout-seconds must be a number" "timeout seconds"
 [[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || flow_error "--recovery-window-seconds must be a number" "recovery window seconds"
@@ -250,41 +238,28 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  STATUS="ERROR"
-  NEXT_REQUIRED_INPUT="run inside corporate network"
-  FAILURE_CATEGORY="environment"
-  FAILURE_SUMMARY="This operation requires corporate network access"
-  SUGGESTED_ACTION="Run inside corporate network."
-  MUTATIONS_PERFORMED=false
-  emit_flow_output
-  exit 1
-fi
-
 LOOKUP_OUTPUT="$WORK_DIR/jenkins-lookup.out"
 lookup_args=(
   "$LOOKUP_WRAPPER"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --branch "$BRANCH"
 )
 [[ -n "$JOB_NAME_ARG" ]] && lookup_args+=(--job-name "$JOB_NAME_ARG")
-run_and_capture "$LOOKUP_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${lookup_args[@]}" || exit 1
+run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
 JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
 JOB_URL="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
 version_args=(
   "$VERSION_WRAPPER"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --job-name "$JOB_NAME"
   --distribution-type "$DISTRIBUTION_TYPE"
 )
 [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-run_and_capture "$VERSION_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${version_args[@]}" || exit 1
+run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
 DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
 PREVIOUS_VERSION="$(value_from_output PREVIOUS_VERSION "$VERSION_OUTPUT")"
 VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
@@ -293,7 +268,6 @@ VERSION_SOURCE="$(value_from_output VERSION_SOURCE "$VERSION_OUTPUT")"
 BUILD_OUTPUT="$WORK_DIR/jenkins-build.out"
 build_args=(
   "$BUILD_WRAPPER"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --branch "$BRANCH"
@@ -308,7 +282,7 @@ build_args=(
   --timeout-seconds "$TIMEOUT_SECONDS"
 )
 [[ "$WAIT" == "true" ]] && build_args+=(--wait)
-run_and_capture "$BUILD_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${build_args[@]}" || exit 1
+run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
 
 STATUS="$(value_from_output STATUS "$BUILD_OUTPUT")"
 JOB_URL="$(value_from_output JOB_URL "$BUILD_OUTPUT")"
@@ -329,7 +303,7 @@ case "$RESULT" in
     ;;
   FAILURE|UNSTABLE|ABORTED)
     ANALYZE_OUTPUT="$WORK_DIR/jenkins-analyze.out"
-    run_and_capture "$ANALYZE_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$ANALYZE_WRAPPER" --build-url "$BUILD_URL" --max-lines 400 || true
+    run_and_capture "$ANALYZE_OUTPUT" bash "$ANALYZE_WRAPPER" --build-url "$BUILD_URL" --max-lines 400 || true
     FAILURE_CATEGORY="$(value_from_output FAILURE_CATEGORY "$ANALYZE_OUTPUT")"
     FAILURE_SUMMARY="$(value_from_output FAILURE_SUMMARY "$ANALYZE_OUTPUT")"
     SUGGESTED_ACTION="$(value_from_output SUGGESTED_ACTION "$ANALYZE_OUTPUT")"

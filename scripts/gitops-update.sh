@@ -14,6 +14,7 @@ emit_error() {
   echo "GITOPS_MODE=${MODE:-}"
   echo "CONFIG_PATH=${CONFIG_PATH:-}"
   echo "VERSION=${VERSION:-}"
+  echo "IMAGE_DIGEST=${IMAGE_DIGEST:-}"
   echo "DIFF_FILE=${DIFF_FILE:-}"
   echo "COMMIT_CREATED=false"
   echo "PUSH_COMPLETED=false"
@@ -25,12 +26,13 @@ emit_error() {
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 MODE=""
 PROJECT_NAME=""
 ENVIRONMENT=""
 DISTRIBUTION_TYPE=""
 VERSION=""
+IMAGE_DIGEST=""
+ADDITIONAL_CONFIG_CHANGES_FILE=""
 CONFIG_REPO_URL="${CONFIG_REPO_URL:-}"
 CONFIG_REPO_BRANCH="${CONFIG_REPO_BRANCH:-}"
 CHARTS_PATH=""
@@ -45,12 +47,13 @@ DIFF_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --mode) require_value "$1" "${2:-}"; MODE="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
     --environment) require_value "$1" "${2:-}"; ENVIRONMENT="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;
     --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
+    --digest) require_value "$1" "${2:-}"; IMAGE_DIGEST="$2"; shift 2 ;;
+    --additional-config-changes-file) require_value "$1" "${2:-}"; ADDITIONAL_CONFIG_CHANGES_FILE="$2"; shift 2 ;;
     --config-repo-url) require_value "$1" "${2:-}"; CONFIG_REPO_URL="$2"; shift 2 ;;
     --config-repo-branch) require_value "$1" "${2:-}"; CONFIG_REPO_BRANCH="$2"; shift 2 ;;
     --charts-path) require_value "$1" "${2:-}"; CHARTS_PATH="$2"; shift 2 ;;
@@ -66,16 +69,21 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$MODE" in create|update) ;; *) emit_error "Missing or unsupported --mode" "mode" ;; esac
+resolve_project_name
 [[ -n "$CONFIG_REPO_URL" ]] || emit_error "Missing required argument: --config-repo-url" "config repo URL"
 [[ -n "$CONFIG_REPO_BRANCH" ]] || emit_error "Missing required argument: --config-repo-branch" "config repo branch"
 [[ -n "$CONFIG_PATH" ]] || emit_error "Missing required argument: --config-path" "config path"
 [[ -n "$VERSION" ]] || emit_error "Missing required argument: --version" "version"
 validate_rendered_path "$CONFIG_PATH" "config path"
 [[ -z "$CONFIG_TEMPLATE_PATH" ]] || validate_rendered_path "$CONFIG_TEMPLATE_PATH" "config template path"
-
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" && "$DRY_RUN" != "true" ]]; then
-  corporate_environment_required_exit
+if [[ -n "$ADDITIONAL_CONFIG_CHANGES_FILE" ]]; then
+  [[ -f "$ADDITIONAL_CONFIG_CHANGES_FILE" ]] || emit_error "Additional config changes file does not exist" "approved patch file"
+  case "$(basename "$ADDITIONAL_CONFIG_CHANGES_FILE")" in .env|*.env) emit_error "Additional config changes file must not be .env" "approved patch file" ;; esac
+  if grep -Eiq '(_TOKEN|PASSWORD|SECRET|BEGIN[[:space:]]+(RSA|OPENSSH|PRIVATE)[[:space:]]+KEY|ARGOCD_AUTH_TOKEN|JENKINS_TOKEN)' "$ADDITIONAL_CONFIG_CHANGES_FILE"; then
+    emit_error "Additional config changes file contains credential-like content" "credential-free approved patch file"
+  fi
 fi
+
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
@@ -87,6 +95,7 @@ if [[ "$DRY_RUN" == "true" ]]; then
   echo "GITOPS_MODE=${MODE}"
   echo "CONFIG_PATH=${CONFIG_PATH}"
   echo "VERSION=${VERSION}"
+  echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
   echo "DIFF_FILE=${DIFF_FILE}"
   echo "COMMIT_CREATED=false"
   echo "PUSH_COMPLETED=false"
@@ -111,13 +120,13 @@ else
   [[ -e "$target" ]] || emit_error "Config path does not exist" "existing config path"
 fi
 
-PYTHONPATH="$SKILL_ROOT" python3 - "$target" "$PROJECT_NAME" "$VERSION" "$ENVIRONMENT" "$DISTRIBUTION_TYPE" "$NAMESPACE" "$ARGOCD_APP_NAME" "$CONFIG_PATH" "$CHARTS_PATH" <<'PY'
+PYTHONPATH="$SKILL_ROOT" python3 - "$target" "$PROJECT_NAME" "$VERSION" "$ENVIRONMENT" "$DISTRIBUTION_TYPE" "$NAMESPACE" "$ARGOCD_APP_NAME" "$CONFIG_PATH" "$CHARTS_PATH" "$IMAGE_DIGEST" <<'PY'
 import os
 import sys
 from pathlib import Path
 from scripts.lib.distribution.templates import render_template
 
-root, project, version, env, dtype, namespace, app_name, config_path, charts_path = sys.argv[1:]
+root, project, version, env, dtype, namespace, app_name, config_path, charts_path, image_digest = sys.argv[1:]
 values = {
     "PROJECT_NAME": project,
     "VERSION": version,
@@ -127,6 +136,7 @@ values = {
     "ARGOCD_APP_NAME": app_name,
     "CONFIG_PATH": config_path,
     "CHARTS_PATH": charts_path,
+    "IMAGE_DIGEST": image_digest,
 }
 for dirpath, _, filenames in os.walk(root):
     for name in filenames:
@@ -144,6 +154,10 @@ PY
 
 (
   cd "$WORK_DIR/repo"
+  if [[ -n "$ADDITIONAL_CONFIG_CHANGES_FILE" ]]; then
+    git apply --check "$ADDITIONAL_CONFIG_CHANGES_FILE" >/dev/null
+    git apply "$ADDITIONAL_CONFIG_CHANGES_FILE"
+  fi
   git diff -- "$CONFIG_PATH" >"$DIFF_FILE"
   changed="$(git diff --name-only)"
   while IFS= read -r path; do
@@ -157,6 +171,7 @@ PY
     echo "GITOPS_MODE=${MODE}"
     echo "CONFIG_PATH=${CONFIG_PATH}"
     echo "VERSION=${VERSION}"
+    echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
     echo "DIFF_FILE=${DIFF_FILE}"
     echo "COMMIT_CREATED=false"
     echo "PUSH_COMPLETED=false"
@@ -176,6 +191,7 @@ PY
   echo "GITOPS_MODE=${MODE}"
   echo "CONFIG_PATH=${CONFIG_PATH}"
   echo "VERSION=${VERSION}"
+  echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
   echo "DIFF_FILE=${DIFF_FILE}"
   echo "COMMIT_CREATED=${commit_created}"
   echo "PUSH_COMPLETED=true"

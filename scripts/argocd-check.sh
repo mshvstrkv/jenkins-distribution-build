@@ -31,7 +31,6 @@ emit_error() {
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 ARGOCD_SERVER=""
 ARGOCD_APP_NAME=""
 ARGOCD_CLI_AVAILABLE=false
@@ -49,7 +48,6 @@ ARGOCD_HEALTH_STATUS=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --argocd-server) require_value "$1" "${2:-}"; ARGOCD_SERVER="$2"; shift 2 ;;
     --argocd-app-name) require_value "$1" "${2:-}"; ARGOCD_APP_NAME="$2"; shift 2 ;;
     --help|-h) exit 0 ;;
@@ -60,9 +58,6 @@ done
 [[ -n "$ARGOCD_SERVER" ]] || emit_error "Missing required argument: --argocd-server" "Argo CD server"
 [[ -n "$ARGOCD_APP_NAME" ]] || emit_error "Missing required argument: --argocd-app-name" "Argo CD app name"
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  corporate_environment_required_exit
-fi
 
 command -v argocd >/dev/null 2>&1 || emit_error "argocd CLI is required but was not found" "argocd CLI"
 ARGOCD_CLI_AVAILABLE=true

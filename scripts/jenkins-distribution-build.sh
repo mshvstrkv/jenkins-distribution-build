@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/lib/common.sh"
+load_skill_env
+
 usage() {
   cat <<'EOF'
 Usage:
   JENKINS_USER=<user> JENKINS_TOKEN=<token> \
   scripts/jenkins-distribution-build.sh \
-    --jenkins-url <url> \
-    --project-name <name> \
-    --branch <branch> \
+    [--jenkins-url <url>] \
+    [--project-name <name>] \
+    [--branch <branch>] \
     [--template-job <name>] \
     [--dry-run]
 
-Required arguments:
-  --jenkins-url    Jenkins base URL or folder URL
-  --project-name   Jenkins job name to find or create
-  --branch         Branch passed to buildWithParameters as BRANCH
-
 Optional arguments:
+  --jenkins-url    Jenkins base URL or folder URL. Defaults to JENKINS_URL from skill .env.
+  --project-name   Jenkins job name to find or create. Defaults to git root/current directory name.
+  --branch         Branch passed to buildWithParameters as BRANCH. Defaults to current git branch.
   --template-job   Existing Jenkins template job used when project job is missing
   --dry-run        Print resolved inputs without contacting Jenkins
 
@@ -112,7 +114,7 @@ curl_status() {
   printf '%s' "$status"
 }
 
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 TEMPLATE_JOB=""
 BRANCH=""
@@ -154,9 +156,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$JENKINS_URL" ]] || die "Missing required argument: --jenkins-url"
-[[ -n "$PROJECT_NAME" ]] || die "Missing required argument: --project-name"
-[[ -n "$BRANCH" ]] || die "Missing required argument: --branch"
+[[ -n "$JENKINS_URL" ]] || die "Missing Jenkins URL"
+resolve_project_name
+resolve_branch
 
 command -v curl >/dev/null 2>&1 || die "curl is required but was not found"
 if ! command -v python3 >/dev/null 2>&1 && ! command -v jq >/dev/null 2>&1; then

@@ -20,7 +20,6 @@ Usage:
     --config-repo-branch <branch> \
     --config-path <path> \
     [--timeout-seconds <number>] \
-    [--execution-environment <local|corporate>] \
     [--approve] \
     [--dry-run]
 
@@ -38,7 +37,6 @@ CONFIG_REPO_URL=""
 CONFIG_REPO_BRANCH=""
 CONFIG_PATH=""
 TIMEOUT_SECONDS=1800
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 APPROVE_ARGS=()
 DRY_RUN_ARGS=()
 
@@ -54,7 +52,6 @@ while [[ $# -gt 0 ]]; do
     --config-repo-branch) require_value "$1" "${2:-}"; CONFIG_REPO_BRANCH="$2"; shift 2 ;;
     --config-path) require_value "$1" "${2:-}"; CONFIG_PATH="$2"; shift 2 ;;
     --timeout-seconds) require_value "$1" "${2:-}"; TIMEOUT_SECONDS="$2"; shift 2 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --approve) APPROVE_ARGS=(--approve); shift ;;
     --dry-run) DRY_RUN_ARGS=(--dry-run); shift ;;
     --help|-h) usage; exit 0 ;;
@@ -63,7 +60,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 exec bash "$SCRIPT_DIR/argocd-sync.sh" \
-  --execution-environment "$EXECUTION_ENVIRONMENT" \
   --mode "$MODE" \
   --argocd-server "$ARGOCD_SERVER" \
   --argocd-app-name "$ARGOCD_APP_NAME" \

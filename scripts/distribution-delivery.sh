@@ -66,7 +66,6 @@ Usage:
     [--argocd-destination-namespace <namespace>] \
     --environment <environment> \
     [--preflight] \
-    [--execution-environment <local|corporate>] \
     [--approve-deployment] \
     [--dry-run] \
     [--wait]
@@ -155,16 +154,14 @@ error_exit() {
   echo "ACTION=blocked"
   echo "REASON=$1"
   echo "NEXT_REQUIRED_INPUT=${2:-}"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
-  exit 1
+      exit 1
 }
 
 sanitize_technical_reason() {
   sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
 }
 
-is_corporate_network_error() {
+is_network_error() {
   case "$1" in
     *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*)
       return 0
@@ -175,27 +172,14 @@ is_corporate_network_error() {
   esac
 }
 
-corporate_environment_required_exit() {
-  echo "STATUS=ERROR"
-  echo "STATE=corporate_environment_required"
-  echo "REASON=This operation requires corporate network access"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
-  echo "MUTATIONS_PERFORMED=false"
-  exit 1
-}
-
-corporate_network_unavailable_exit() {
+jenkins_unreachable_exit() {
   local technical_reason="$1"
   technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
   echo "STATUS=ERROR"
-  echo "STATE=corporate_network_unavailable"
-  echo "REASON=Corporate service is unreachable from the current environment"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
-  echo "MUTATIONS_PERFORMED=false"
+  echo "STATE=jenkins_unreachable"
+  echo "REASON=Unable to connect to Jenkins"
+  echo "NEXT_REQUIRED_INPUT=Jenkins access"
+      echo "MUTATIONS_PERFORMED=false"
   [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
   exit 1
 }
@@ -356,8 +340,8 @@ curl_http() {
   if ! status="$(curl --silent --show-error --output "$body_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@" 2>"$WORK_DIR/curl.err")"; then
     local message
     message="$(tr '\n' ' ' <"$WORK_DIR/curl.err" | sed 's/[[:space:]]\+/ /g')"
-    if is_corporate_network_error "$message"; then
-      corporate_network_unavailable_exit "$message"
+    if is_network_error "$message"; then
+      jenkins_unreachable_exit "$message"
     fi
     status="000"
   fi
@@ -380,14 +364,12 @@ jenkins_metadata_error_exit() {
   local technical_reason="$1"
   technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
   echo "STATUS=ERROR"
-  echo "STATE=corporate_network_unavailable"
+  echo "STATE=jenkins_unreachable"
   echo "REASON=Failed to connect to Jenkins job metadata endpoint"
   echo "JOB_URL=${lookup_job_url:-}"
   echo "JENKINS_METADATA_URL=${JENKINS_METADATA_URL:-}"
   echo "NEXT_REQUIRED_INPUT=Jenkins API access"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT:-}"
-  echo "MUTATIONS_PERFORMED=false"
+      echo "MUTATIONS_PERFORMED=false"
   [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
   exit 1
 }
@@ -494,8 +476,8 @@ clone_gitops_repo() {
   GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" git ls-remote --heads "$CONFIG_REPO_URL" "$CONFIG_REPO_BRANCH" >/dev/null 2>"$WORK_DIR/git-ls-remote.err" || {
     local message
     message="$(tr '\n' ' ' <"$WORK_DIR/git-ls-remote.err" | sed 's/[[:space:]]\+/ /g')"
-    if is_corporate_network_error "$message"; then
-      corporate_network_unavailable_exit "$message"
+    if is_network_error "$message"; then
+      jenkins_unreachable_exit "$message"
     fi
     error_exit "Git SSH authentication failed" "Git SSH credentials or SSH agent"
   }
@@ -629,7 +611,7 @@ commit_and_push_config() {
 load_skill_env
 
 ORIGINAL_ARGS=("$@")
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 BRANCH=""
 JOB_NAME=""
@@ -652,9 +634,6 @@ CONFIG_TEMPLATE_PATH=""
 CHARTS_PATH=""
 ARGOCD_APP_NAME=""
 ENVIRONMENT="ift"
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
-CHILD_EXECUTION_ENVIRONMENT=""
-EXECUTION_ENVIRONMENT_CLI=""
 DRY_RUN=false
 PREFLIGHT=false
 APPROVE_DEPLOYMENT=false
@@ -684,7 +663,6 @@ while [[ $# -gt 0 ]]; do
     --argocd-destination-server) require_value "$1" "${2:-}"; ARGOCD_DESTINATION_SERVER="$2"; shift 2 ;;
     --argocd-destination-namespace) require_value "$1" "${2:-}"; ARGOCD_DESTINATION_NAMESPACE="$2"; shift 2 ;;
     --environment) require_value "$1" "${2:-}"; ENVIRONMENT="$2"; shift 2 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT_CLI="$2"; shift 2 ;;
     --jenkins-branch-param) require_value "$1" "${2:-}"; JENKINS_BRANCH_PARAM="$2"; shift 2 ;;
     --jenkins-version-param) require_value "$1" "${2:-}"; JENKINS_VERSION_PARAM="$2"; shift 2 ;;
     --jenkins-distribution-type-param) require_value "$1" "${2:-}"; JENKINS_DISTRIBUTION_TYPE_PARAM="$2"; shift 2 ;;
@@ -697,22 +675,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$EXECUTION_ENVIRONMENT_CLI" ]]; then
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT_CLI"
-fi
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
 
 if [[ "$PREFLIGHT" == "true" ]]; then
   export SKILL_ENV_WARNING_EMITTED=1
   exec "$SCRIPT_DIR/preflight.sh" "${ORIGINAL_ARGS[@]}"
 fi
 
-[[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
-[[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
-[[ -n "$BRANCH" ]] || error_exit "Missing required argument: --branch" "branch"
+resolve_jenkins_url
+resolve_project_name
+resolve_branch
 [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"
 if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$DISTRIBUTION_TYPE")"; then
   error_exit "Unsupported distribution type" "ift or release"
@@ -763,51 +734,31 @@ fi
 [[ -n "$ENVIRONMENT" ]] || error_exit "Missing required argument: --environment" "environment"
 validate_config_path
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  if [[ "$DRY_RUN" == "true" ]]; then
-    echo "STATUS=OK"
-    echo "ACTION=dry-run"
-    echo "PROJECT_NAME=${PROJECT_NAME}"
-    echo "BRANCH=${BRANCH}"
-    echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
-    echo "CHARTS_PATH=${CHARTS_PATH}"
-    echo "CONFIG_PATH=${CONFIG_PATH}"
-    echo "CONFIG_TEMPLATE_PATH=${CONFIG_TEMPLATE_PATH}"
-    echo "ARGOCD_APP_NAME=${ARGOCD_APP_NAME}"
-    echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
-    echo "MUTATIONS_PERFORMED=false"
-    exit 0
-  fi
-  corporate_environment_required_exit
-fi
-
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 LOOKUP_OUTPUT="$WORK_DIR/jenkins-lookup.out"
 lookup_args=(
   "$SCRIPT_DIR/jenkins-lookup.sh"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --branch "$BRANCH"
 )
 [[ -n "$JOB_NAME" ]] && lookup_args+=(--job-name "$JOB_NAME")
 [[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
-run_and_capture "$LOOKUP_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${lookup_args[@]}" || exit 1
+run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
 JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
 version_args=(
   "$SCRIPT_DIR/version-resolver.sh"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
   --distribution-type "$DISTRIBUTION_TYPE"
 )
 [[ -n "$JOB_NAME" ]] && version_args+=(--job-name "$JOB_NAME")
 [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-run_and_capture "$VERSION_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${version_args[@]}" || exit 1
+run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
 DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
 VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
 
@@ -822,7 +773,6 @@ build_args=(
   --jenkins-branch-param "$JENKINS_BRANCH_PARAM"
   --jenkins-version-param "$JENKINS_VERSION_PARAM"
   --jenkins-distribution-type-param "$JENKINS_DISTRIBUTION_TYPE_PARAM"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --wait
 )
 [[ -n "$JOB_NAME" ]] && build_args+=(--job-name "$JOB_NAME")
@@ -830,8 +780,7 @@ build_args=(
 [[ -n "$TEMPLATE_JOB" ]] && build_args+=(--template-job "$TEMPLATE_JOB")
 [[ -n "$VERSION" ]] && build_args+=(--version "$VERSION")
 [[ "$DRY_RUN" == "true" ]] && build_args+=(--dry-run)
-CHILD_EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT"
-run_and_capture "$BUILD_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${build_args[@]}" || exit 1
+run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
 
 build_status="$(value_from_output STATUS "$BUILD_OUTPUT")"
 if [[ "$build_status" == "ERROR" ]]; then
@@ -854,7 +803,7 @@ case "$RESULT" in
   SUCCESS)
     ;;
   FAILURE|UNSTABLE|ABORTED)
-    env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/jenkins-analyze-failure.sh" --build-url "$BUILD_URL" --max-lines 400
+    bash "$SCRIPT_DIR/jenkins-analyze-failure.sh" --build-url "$BUILD_URL" --max-lines 400
     exit 1
     ;;
   *)
@@ -863,8 +812,7 @@ case "$RESULT" in
 esac
 
 GITOPS_CHECK_OUTPUT="$WORK_DIR/gitops-check.out"
-run_and_capture "$GITOPS_CHECK_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/gitops-check.sh" \
-  --execution-environment "$EXECUTION_ENVIRONMENT" \
+run_and_capture "$GITOPS_CHECK_OUTPUT" bash "$SCRIPT_DIR/gitops-check.sh" \
   --project-name "$PROJECT_NAME" \
   --environment "$ENVIRONMENT" \
   --config-repo-url "$CONFIG_REPO_URL" \
@@ -876,8 +824,7 @@ CONFIG_EXISTS="$(value_from_output CONFIG_EXISTS "$GITOPS_CHECK_OUTPUT")"
 CONFIG_TEMPLATE_EXISTS="$(value_from_output CONFIG_TEMPLATE_EXISTS "$GITOPS_CHECK_OUTPUT")"
 
 ARGO_CHECK_OUTPUT="$WORK_DIR/argocd-check.out"
-run_and_capture "$ARGO_CHECK_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/argocd-check.sh" \
-  --execution-environment "$EXECUTION_ENVIRONMENT" \
+run_and_capture "$ARGO_CHECK_OUTPUT" bash "$SCRIPT_DIR/argocd-check.sh" \
   --argocd-server "$ARGOCD_SERVER" \
   --argocd-app-name "$ARGOCD_APP_NAME" || exit 1
 ARGOCD_APP_EXISTS="$(value_from_output ARGOCD_APP_EXISTS "$ARGO_CHECK_OUTPUT")"
@@ -903,7 +850,6 @@ fi
 GITOPS_UPDATE_OUTPUT="$WORK_DIR/gitops-update.out"
 gitops_update_args=(
   "$SCRIPT_DIR/gitops-update.sh"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --mode "$ARGOCD_MODE"
   --project-name "$PROJECT_NAME"
   --environment "$ENVIRONMENT"
@@ -918,7 +864,7 @@ gitops_update_args=(
   --argocd-app-name "$ARGOCD_APP_NAME"
 )
 [[ "$APPROVE_DEPLOYMENT" == "true" ]] && gitops_update_args+=(--approve)
-run_and_capture "$GITOPS_UPDATE_OUTPUT" env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${gitops_update_args[@]}" || exit 1
+run_and_capture "$GITOPS_UPDATE_OUTPUT" bash "${gitops_update_args[@]}" || exit 1
 if [[ "$APPROVE_DEPLOYMENT" != "true" ]]; then
   exit 1
 fi
@@ -929,7 +875,6 @@ fi
 
 argocd_sync_args=(
   "$SCRIPT_DIR/argocd-sync.sh"
-  --execution-environment "$EXECUTION_ENVIRONMENT"
   --mode "$ARGOCD_MODE"
   --argocd-server "$ARGOCD_SERVER"
   --argocd-app-name "$ARGOCD_APP_NAME"
@@ -942,12 +887,10 @@ argocd_sync_args=(
   --timeout-seconds "$TIMEOUT_SECONDS"
 )
 [[ "$APPROVE_DEPLOYMENT" == "true" ]] && argocd_sync_args+=(--approve)
-env EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${argocd_sync_args[@]}"
+bash "${argocd_sync_args[@]}"
 
 echo "STATUS=OK"
 echo "ACTION=delivered"
-echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
-echo "CHILD_EXECUTION_ENVIRONMENT=${CHILD_EXECUTION_ENVIRONMENT}"
 echo "PROJECT_NAME=${PROJECT_NAME}"
 echo "ENVIRONMENT=${ENVIRONMENT}"
 echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"

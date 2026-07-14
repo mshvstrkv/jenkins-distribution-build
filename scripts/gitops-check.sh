@@ -33,7 +33,6 @@ emit_error() {
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 PROJECT_NAME=""
 ENVIRONMENT="ift"
 CONFIG_REPO_URL="${CONFIG_REPO_URL:-}"
@@ -49,7 +48,6 @@ CONFIG_TEMPLATE_EXISTS=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
     --environment) require_value "$1" "${2:-}"; ENVIRONMENT="$2"; shift 2 ;;
     --config-repo-url) require_value "$1" "${2:-}"; CONFIG_REPO_URL="$2"; shift 2 ;;
@@ -71,9 +69,6 @@ validate_rendered_path "$CHARTS_PATH" "charts path"
 validate_rendered_path "$CONFIG_PATH" "config path"
 validate_rendered_path "$CONFIG_TEMPLATE_PATH" "config template path"
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  corporate_environment_required_exit
-fi
 
 command -v git >/dev/null 2>&1 || emit_error "git is required but was not found" "git"
 

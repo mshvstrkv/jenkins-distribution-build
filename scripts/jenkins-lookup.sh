@@ -31,17 +31,15 @@ usage() {
 Usage:
   JENKINS_USER=<user> JENKINS_TOKEN=<token> \
   bash scripts/jenkins-lookup.sh \
-    --jenkins-url <url> \
-    --project-name <name> \
+    [--jenkins-url <url>] \
+    [--project-name <name>] \
     [--branch <branch>] \
     [--job-name <job-name>] \
     [--template-job <job-name>]
 
-Required arguments:
-  --jenkins-url     Jenkins base or folder URL
-  --project-name    Project name used to find Jenkins job
-
 Optional arguments:
+  --jenkins-url     Jenkins base or folder URL. Defaults to JENKINS_URL from skill .env.
+  --project-name    Project name used to find Jenkins job. Defaults to git root/current directory name.
   --branch         Optional. Accepted for interface compatibility with jenkins-build.sh. Ignored by lookup.
   --job-name        Explicit Jenkins job name checked before generated candidates
   --template-job    Template job name available for later creation
@@ -61,8 +59,6 @@ emit_common() {
   echo "EXISTS=${EXISTS:-}"
   echo "TEMPLATE_JOB=${TEMPLATE_JOB:-}"
   echo "CHECKED_JOB_NAMES=${CHECKED_JOB_NAMES_CSV:-}"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
 }
 
 error_exit() {
@@ -81,7 +77,7 @@ sanitize_technical_reason() {
   sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
 }
 
-is_corporate_network_error() {
+is_network_error() {
   case "$1" in
     *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*)
       return 0
@@ -90,27 +86,31 @@ is_corporate_network_error() {
   esac
 }
 
-corporate_environment_required_exit() {
-  echo "STATUS=ERROR"
-  echo "STATE=corporate_environment_required"
-  echo "REASON=This operation requires corporate network access"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
-  emit_common
-  echo "MUTATIONS_PERFORMED=false"
-  exit 1
-}
-
-corporate_network_unavailable_exit() {
+jenkins_unreachable_exit() {
   local technical_reason="$1"
   technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
   echo "STATUS=ERROR"
-  echo "STATE=corporate_network_unavailable"
-  echo "REASON=Corporate service is unreachable from the current environment"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
+  echo "STATE=jenkins_unreachable"
+  echo "REASON=Unable to connect to Jenkins"
+  echo "NEXT_REQUIRED_INPUT=Jenkins access"
   emit_common
   echo "MUTATIONS_PERFORMED=false"
   [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
   exit 1
+}
+
+resolve_project_name() {
+  if [[ -n "$PROJECT_NAME" ]]; then
+    return 0
+  fi
+  local git_root
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$git_root" ]]; then
+    PROJECT_NAME="$(basename "$git_root")"
+  else
+    PROJECT_NAME="$(basename "$(pwd)")"
+  fi
+  [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
 }
 
 require_value() {
@@ -187,7 +187,7 @@ curl_get_status() {
   return 0
 }
 
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 BRANCH=""
 TEMPLATE_JOB=""
@@ -199,7 +199,6 @@ CHECKED_JOB_NAMES=()
 CHECKED_JOB_NAMES_CSV=""
 CURL_STATUS=""
 CURL_ERROR_MESSAGE=""
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -228,11 +227,6 @@ while [[ $# -gt 0 ]]; do
       TEMPLATE_JOB="$2"
       shift 2
       ;;
-    --execution-environment)
-      require_value "$1" "${2:-}"
-      EXECUTION_ENVIRONMENT="$2"
-      shift 2
-      ;;
     --help|-h)
       usage
       exit 0
@@ -243,12 +237,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
-[[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
+JENKINS_URL="${JENKINS_URL:-${JENKINS_URL:-}}"
+[[ -n "$JENKINS_URL" ]] || error_exit "Missing Jenkins URL" "JENKINS_URL"
+resolve_project_name
 [[ -n "${JENKINS_USER:-}" ]] || error_exit "Missing required environment variable: JENKINS_USER" "JENKINS_USER"
 [[ -n "${JENKINS_TOKEN:-}" ]] || error_exit "Missing required environment variable: JENKINS_TOKEN" "JENKINS_TOKEN"
 command -v curl >/dev/null 2>&1 || error_exit "curl is required but was not found" "curl"
@@ -256,10 +247,6 @@ command -v python3 >/dev/null 2>&1 || error_exit "python3 is required but was no
 
 JENKINS_URL="${JENKINS_URL%/}"
 build_candidate_job_names
-
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  corporate_environment_required_exit
-fi
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -270,8 +257,8 @@ ERROR_FILE="${TMP_DIR}/curl-error"
 for candidate in "${CHECKED_JOB_NAMES[@]}"; do
   candidate_url="$(job_url_for "$candidate")"
   if ! curl_get_status "$BODY_FILE" "$HEADERS_FILE" "${candidate_url}/api/json"; then
-    if is_corporate_network_error "$CURL_ERROR_MESSAGE"; then
-      corporate_network_unavailable_exit "$CURL_ERROR_MESSAGE"
+    if is_network_error "$CURL_ERROR_MESSAGE"; then
+      jenkins_unreachable_exit "$CURL_ERROR_MESSAGE"
     fi
     error_exit "$CURL_ERROR_MESSAGE" "Jenkins access"
   fi

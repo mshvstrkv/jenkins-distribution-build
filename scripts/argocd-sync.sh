@@ -24,7 +24,6 @@ emit_error() {
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 MODE=""
 ARGOCD_SERVER=""
 ARGOCD_APP_NAME=""
@@ -41,7 +40,6 @@ DRY_RUN=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --mode) require_value "$1" "${2:-}"; MODE="$2"; shift 2 ;;
     --argocd-server) require_value "$1" "${2:-}"; ARGOCD_SERVER="$2"; shift 2 ;;
     --argocd-app-name) require_value "$1" "${2:-}"; ARGOCD_APP_NAME="$2"; shift 2 ;;
@@ -64,9 +62,6 @@ case "$MODE" in create|update) ;; *) emit_error "Missing or unsupported --mode" 
 [[ -n "$ARGOCD_APP_NAME" ]] || emit_error "Missing required argument: --argocd-app-name" "Argo CD app name"
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || emit_error "--timeout-seconds must be a number" "timeout seconds"
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" && "$DRY_RUN" != "true" ]]; then
-  corporate_environment_required_exit
-fi
 
 if [[ "$DRY_RUN" == "true" || "$APPROVE" != "true" ]]; then
   next=""

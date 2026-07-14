@@ -8,7 +8,6 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/version-resolver.sh \
-    --execution-environment <local|corporate> \
     --jenkins-url <url> \
     --project-name <name> \
     --job-name <name> \
@@ -114,9 +113,7 @@ PY
 
 load_skill_env
 
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
-EXECUTION_ENVIRONMENT_CLI=""
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 JOB_NAME=""
 DISTRIBUTION_TYPE=""
@@ -125,7 +122,6 @@ VERSION=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT_CLI="$2"; shift 2 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
     --job-name) require_value "$1" "${2:-}"; JOB_NAME="$2"; shift 2 ;;
@@ -136,15 +132,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$EXECUTION_ENVIRONMENT_CLI" ]]; then
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT_CLI"
-fi
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
 
-[[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
+resolve_project_name
 [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"
 DISTRIBUTION_TYPE="$(PYTHONPATH="$SKILL_ROOT" python3 - "$DISTRIBUTION_TYPE" <<'PY'
 import sys
@@ -163,11 +152,8 @@ if [[ -n "$VERSION" ]]; then
   exit $?
 fi
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  corporate_environment_required_exit
-fi
 
-[[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
+resolve_jenkins_url
 [[ -n "$JOB_NAME" ]] || error_exit "Missing required argument: --job-name" "Jenkins job name"
 [[ -n "${JENKINS_USER:-}" ]] || error_exit "Missing required environment variable: JENKINS_USER" "JENKINS_USER"
 [[ -n "${JENKINS_TOKEN:-}" ]] || error_exit "Missing required environment variable: JENKINS_TOKEN" "JENKINS_TOKEN"
@@ -188,10 +174,10 @@ status="$(curl_http "$BUILDS_JSON" "$HEADERS" "$ERROR_FILE" --globoff --user "${
 if [[ "$status" == "000" ]]; then
   message="$(tr '\n' ' ' <"$ERROR_FILE" | sanitize_technical_reason | sed 's/[[:space:]]\+/ /g')"
   echo "STATUS=ERROR"
-  echo "STATE=corporate_network_unavailable"
+  echo "STATE=jenkins_unreachable"
   echo "ACTION=resolve-version"
-  echo "REASON=Corporate service is unreachable from the current environment"
-  echo "NEXT_REQUIRED_INPUT=run inside corporate network"
+  echo "REASON=Unable to connect to Jenkins"
+  echo "NEXT_REQUIRED_INPUT=Jenkins access"
   echo "MUTATIONS_PERFORMED=false"
   [[ -n "$message" ]] && echo "TECHNICAL_REASON=${message}"
   exit 1

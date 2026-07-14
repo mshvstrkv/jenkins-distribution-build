@@ -14,8 +14,7 @@ Usage:
     --config-repo-branch <branch> \
     --config-path <path> \
     --argocd-server <server> \
-    --argocd-app-name <name> \
-    [--execution-environment <local|corporate>]
+    --argocd-app-name <name>
 
 Compatibility wrapper. New read-only flows should use:
   scripts/gitops-check.sh
@@ -28,7 +27,6 @@ CONFIG_REPO_BRANCH=""
 CONFIG_PATH=""
 ARGOCD_SERVER=""
 ARGOCD_APP_NAME=""
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -37,7 +35,6 @@ while [[ $# -gt 0 ]]; do
     --config-path) require_value "$1" "${2:-}"; CONFIG_PATH="$2"; shift 2 ;;
     --argocd-server) require_value "$1" "${2:-}"; ARGOCD_SERVER="$2"; shift 2 ;;
     --argocd-app-name) require_value "$1" "${2:-}"; ARGOCD_APP_NAME="$2"; shift 2 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT="$2"; shift 2 ;;
     --help|-h) usage; exit 0 ;;
     *) error_exit "Unknown argument: $1" "blocked" "$1" ;;
   esac
@@ -51,10 +48,8 @@ done
 
 set +e
 gitops_output="$(
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" \
   bash "$SCRIPT_DIR/gitops-check.sh" \
-    --execution-environment "$EXECUTION_ENVIRONMENT" \
-    --config-repo-url "$CONFIG_REPO_URL" \
+      --config-repo-url "$CONFIG_REPO_URL" \
     --config-repo-branch "$CONFIG_REPO_BRANCH" \
     --config-path "$CONFIG_PATH" \
     --charts-path "." \
@@ -69,10 +64,8 @@ fi
 
 set +e
 argo_output="$(
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" \
   bash "$SCRIPT_DIR/argocd-check.sh" \
-    --execution-environment "$EXECUTION_ENVIRONMENT" \
-    --argocd-server "$ARGOCD_SERVER" \
+      --argocd-server "$ARGOCD_SERVER" \
     --argocd-app-name "$ARGOCD_APP_NAME"
 )"
 argo_rc=$?
@@ -93,6 +86,4 @@ echo "CONFIG_EXISTS=${config_exists}"
 echo "ARGOCD_APP_EXISTS=${argocd_app_exists}"
 echo "FIRST_DEPLOYMENT=${first_deployment}"
 echo "DEPLOYMENT_MODE=${deployment_mode}"
-echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
-echo "CHILD_EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
 echo "MUTATIONS_PERFORMED=false"

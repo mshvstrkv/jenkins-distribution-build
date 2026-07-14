@@ -74,7 +74,7 @@ Before the first wrapper invocation, the agent must not:
 - create task files, plan files, or todo lists
 - check whether `scripts/distribution` exists inside the application repository
 - read implementation wrapper files
-- independently determine corporate network availability
+- independently determine network availability
 
 ## Skill Path Policy
 
@@ -149,7 +149,10 @@ Legacy wrapper scripts exist for backward compatibility and implementation compa
 Use these commands:
 - read-only validation: `scripts/distribution preflight`
 - full delivery: `scripts/distribution deploy`
+- delivery of an already completed Jenkins build: `scripts/distribution deploy-existing`
 - Jenkins-only build: `scripts/distribution build`
+- exact Jenkins build status: `scripts/distribution status`
+- exact Jenkins image digest resolution: `scripts/distribution digest`
 - version resolution: `scripts/distribution version`
 - failure analysis: `scripts/distribution analyze`
 - GitOps read-only check: `scripts/distribution gitops-check`
@@ -204,7 +207,7 @@ execute the deploy flow immediately if defaults and wrapper-loaded `.env` allow 
 Do not ask:
 - where the wrapper is
 - whether `scripts/` exists in the project
-- whether the environment is corporate, if the user already stated it
+- whether the execution environment is correct
 - for Jenkins URL, if wrappers can load it from skill `.env`
 - for project name, if wrappers can use the current project context
 - for version
@@ -229,6 +232,98 @@ It must not run:
 - Kubernetes operations
 
 `scripts/jenkins-build.sh` is a low-level compatibility wrapper. The skill should not use it directly unless the user explicitly asks for the low-level wrapper.
+
+## Existing Build Delivery Policy
+
+Use `scripts/distribution deploy-existing` when the user selects an already completed Jenkins build, build URL, build number, or exact existing version to deploy.
+
+`deploy-existing` is authoritative for this flow:
+
+exact Jenkins build status
+-> exact image digest resolution
+-> GitOps check/update
+-> Argo CD check/sync
+
+It must not:
+- invoke `scripts/distribution build`
+- invoke `scripts/distribution deploy`
+- run `scripts/version-resolver.sh`
+- run `scripts/jenkins-build.sh`
+- trigger a new Jenkins build
+- create a Jenkins queue item
+- calculate the next version
+
+Explicit `--version` does not mean "reuse existing build" for normal `build` or `deploy`. To deploy an already built version, use:
+
+`scripts/distribution deploy-existing`
+
+A finished successful build is not stale merely because a newer version can be calculated.
+
+An explicit user-selected build/version is authoritative for `deploy-existing`.
+
+Do not request a rebuild after status, digest, or polling errors unless the user explicitly asks to rebuild.
+
+Use `scripts/distribution status` for read-only status checks of an exact existing Jenkins build.
+
+Use `scripts/distribution digest` for read-only image digest resolution of an exact existing Jenkins build.
+
+## Repeat Deployment Policy
+
+For an existing deployment, updating `VERSION` and `IMAGE_DIGEST` is mandatory and does not require additional confirmation.
+
+Repeat deployment is determined only by wrapper output:
+
+`CONFIG_EXISTS=true`
+`ARGOCD_APP_EXISTS=true`
+`DEPLOYMENT_MODE=update`
+
+The original user request to build and deploy is sufficient approval for:
+- GitOps version update
+- GitOps digest update
+- Git commit and push
+- Argo CD sync
+
+Before mutation, ask at most one scope question:
+
+"Кроме версии и digest, нужно изменить что-то ещё в конфигурации стенда?"
+
+This is not a confirmation prompt.
+
+If the user already said any of the following, do not ask again:
+- "ничего больше менять не нужно"
+- "только версия и digest"
+- "просто обнови версию"
+- "обычный деплой"
+
+In that case continue immediately with:
+
+`scripts/distribution deploy-existing ... --no-extra-config-changes`
+
+If the user says no to the scope question, continue immediately with:
+
+`scripts/distribution deploy-existing ... --no-extra-config-changes`
+
+If the user says yes, pause and ask only for exact additional GitOps configuration changes.
+
+Never start another Jenkins build while waiting for this answer.
+
+Never recalculate the next version while waiting for this answer.
+
+Never search for a different Jenkins build while waiting for this answer.
+
+Use the same exact `BUILD_URL`, `VERSION`, and `IMAGE_DIGEST` when resuming.
+
+Resume after `STATUS=PAUSED` must use:
+
+`scripts/distribution deploy-existing ... --resume --build-url <exact-url> --version <exact-version> --digest <exact-digest> --no-extra-config-changes`
+
+Resume must not call Jenkins build, version resolver, or a digest resolver for another build.
+
+For additional changes, use only the supported wrapper contract:
+
+`scripts/distribution deploy-existing ... --additional-config-changes-file <approved-patch-file>`
+
+The agent must not edit GitOps YAML directly.
 
 ## Full Workflow
 
@@ -309,12 +404,6 @@ For full delivery requests, execute `scripts/distribution deploy`.
 
 For preflight requests, execute `scripts/distribution preflight`.
 
-Real preflight, Jenkins build, GitOps, and Argo CD operations require:
-
-`--execution-environment corporate`
-
-Outside the corporate network, run only local validation commands.
-
 For "build distributive" requests, include `--wait`.
 
 Do not stop after Jenkins queueing. The wrapper must wait for the final Jenkins result.
@@ -329,49 +418,24 @@ Do not explain what you are going to do before wrapper execution.
 
 Execute wrappers directly.
 
-## Corporate Environment Policy
+## Network Policy
 
-This skill is designed to run inside the corporate network.
+This skill is intended for the managed infrastructure where Jenkins, GitOps, and Argo CD are reachable.
 
-Real Jenkins, Bitbucket, Argo CD, and Kubernetes operations must only be executed from an environment with corporate network access.
-
-Outside the corporate environment, run only:
-- syntax checks
-- self-tests
-- fixture tests
-- dry-run
-- local template rendering validation
-
-Do not treat DNS, TLS, proxy, VPN, or network failures outside the corporate environment as wrapper implementation defects.
-
-If corporate services are unreachable:
-- stop immediately
-- report that corporate network access is required
-- do not diagnose VPN, proxy, certificates, or hostnames
-- do not modify wrappers
-- do not retry with insecure options
-
-Do not:
-- change Jenkins URL
-- change proxy settings
-- change `NO_PROXY`
-- disable TLS verification
-- use `curl -k`
-- import certificates
-- change trust stores
-- search for corporate access workarounds
-
-Never automatically infer `corporate` mode from DNS, TLS, or host reachability.
-
-The agent must not claim it is outside the corporate network unless wrapper output proves that.
-
-If the user states that execution is inside the corporate environment, pass:
-
-`--execution-environment corporate`
+The agent must not determine network availability independently.
 
 Do not run custom network checks.
 
-Do not ask again whether the environment is corporate.
+Do not ask the user to classify the execution environment.
+
+If a wrapper reports that Jenkins is unreachable, stop and report wrapper output:
+- `STATE`
+- `REASON`
+- `NEXT_REQUIRED_INPUT`
+
+Do not diagnose VPN, proxy, certificates, hostnames, or trust stores.
+
+Do not retry with insecure options such as `curl -k`.
 
 ## Validation Policy
 
@@ -392,21 +456,21 @@ It checks only:
 
 Local validation must not access:
 - Jenkins
-- corporate Bitbucket
+- Bitbucket
 - Argo CD
 - Kubernetes
 
-Corporate preflight uses:
+Preflight uses:
 
-`scripts/distribution preflight --execution-environment corporate`
+`scripts/distribution preflight`
 
-Corporate preflight is only for environments inside the corporate network and checks:
+Preflight checks:
 - Jenkins
 - Bitbucket through Git SSH
 - Argo CD
 - deployment state
 
-If wrappers return `STATE=corporate_environment_required` or `STATE=corporate_network_unavailable`, stop immediately and report:
+If wrappers return `STATUS=ERROR`, stop immediately and report:
 - `REASON`
 - `NEXT_REQUIRED_INPUT`
 
@@ -442,6 +506,10 @@ Report the wrapper's full stage summary.
 Full build and deployment runs only through:
 
 `scripts/distribution deploy`
+
+Delivery of an already existing Jenkins build runs only through:
+
+`scripts/distribution deploy-existing`
 
 `scripts/distribution-delivery.sh` is the legacy delivery wrapper behind the CLI.
 
@@ -544,6 +612,12 @@ Do not print `JENKINS_TOKEN` or `ARGOCD_AUTH_TOKEN`.
 Do not print `.env`.
 
 Do not read credential values manually.
+
+The agent must never inspect `.env` to locate Argo CD settings.
+
+Wrappers load `.env` internally.
+
+If Argo authentication fails, report only wrapper `REASON` and `NEXT_REQUIRED_INPUT`.
 
 
 ## Wrapper Error Policy

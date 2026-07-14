@@ -8,7 +8,6 @@ usage() {
   cat <<'EOF'
 Usage:
   bash scripts/preflight.sh \
-    --execution-environment <local|corporate> \
     --jenkins-url <url> \
     --project-name <name> \
     --branch <branch> \
@@ -196,13 +195,12 @@ run_jenkins_stage() {
   local lookup_output="$WORK_DIR/jenkins-lookup.out"
   local lookup_args=(
     "$SCRIPT_DIR/jenkins-lookup.sh"
-    --execution-environment "$EXECUTION_ENVIRONMENT"
-    --jenkins-url "$JENKINS_URL"
+      --jenkins-url "$JENKINS_URL"
     --project-name "$PROJECT_NAME"
     --branch "$BRANCH"
   )
   [[ -n "$JOB_NAME_ARG" ]] && lookup_args+=(--job-name "$JOB_NAME_ARG")
-  if ! run_and_capture "$lookup_output" env SKILL_ENV_WARNING_EMITTED=1 EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${lookup_args[@]}" >/dev/null; then
+  if ! run_and_capture "$lookup_output" env SKILL_ENV_WARNING_EMITTED=1 bash "${lookup_args[@]}" >/dev/null; then
     JENKINS_LOOKUP=FAILED
     set_stage_failed_from_output JENKINS "$lookup_output"
     return 0
@@ -253,14 +251,13 @@ run_jenkins_stage() {
   local version_output="$WORK_DIR/version.out"
   local version_args=(
     "$SCRIPT_DIR/version-resolver.sh"
-    --execution-environment "$EXECUTION_ENVIRONMENT"
-    --jenkins-url "$JENKINS_URL"
+      --jenkins-url "$JENKINS_URL"
     --project-name "$PROJECT_NAME"
     --job-name "$JOB_NAME"
     --distribution-type "$DISTRIBUTION_TYPE"
   )
   [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-  if ! run_and_capture "$version_output" env SKILL_ENV_WARNING_EMITTED=1 EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "${version_args[@]}" >/dev/null; then
+  if ! run_and_capture "$version_output" env SKILL_ENV_WARNING_EMITTED=1 bash "${version_args[@]}" >/dev/null; then
     set_stage_failed_from_output JENKINS "$version_output"
     return 0
   fi
@@ -283,9 +280,8 @@ run_gitops_stage() {
 
   GITOPS_PREFLIGHT=FAILED
   local output="$WORK_DIR/gitops-check.out"
-  if ! run_and_capture "$output" env SKILL_ENV_WARNING_EMITTED=1 EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/gitops-check.sh" \
-    --execution-environment "$EXECUTION_ENVIRONMENT" \
-    --project-name "$PROJECT_NAME" \
+  if ! run_and_capture "$output" env SKILL_ENV_WARNING_EMITTED=1 bash "$SCRIPT_DIR/gitops-check.sh" \
+      --project-name "$PROJECT_NAME" \
     --environment "$ENVIRONMENT" \
     --config-repo-url "$CONFIG_REPO_URL" \
     --config-repo-branch "$CONFIG_REPO_BRANCH" \
@@ -315,9 +311,8 @@ run_argo_stage() {
 
   ARGO_PREFLIGHT=FAILED
   local output="$WORK_DIR/argocd-check.out"
-  if ! run_and_capture "$output" env SKILL_ENV_WARNING_EMITTED=1 EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT" bash "$SCRIPT_DIR/argocd-check.sh" \
-    --execution-environment "$EXECUTION_ENVIRONMENT" \
-    --argocd-server "$ARGOCD_SERVER" \
+  if ! run_and_capture "$output" env SKILL_ENV_WARNING_EMITTED=1 bash "$SCRIPT_DIR/argocd-check.sh" \
+      --argocd-server "$ARGOCD_SERVER" \
     --argocd-app-name "$ARGOCD_APP_NAME" >/dev/null; then
     ARGO_REASON="$(value_from_output ARGO_REASON "$output")"
     ARGO_NEXT_REQUIRED_INPUT="$(value_from_output ARGO_NEXT_REQUIRED_INPUT "$output")"
@@ -369,8 +364,7 @@ emit_report() {
     echo "ACTION=preflight"
   fi
   echo "PREFLIGHT_RESULT=${PREFLIGHT_RESULT}"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT}"
-  echo "PROJECT_NAME=${PROJECT_NAME}"
+    echo "PROJECT_NAME=${PROJECT_NAME}"
   echo "BRANCH=${BRANCH}"
   echo "MUTATIONS_PERFORMED=false"
 
@@ -420,7 +414,7 @@ emit_report() {
   echo "DEPLOYMENT_MODE=${DEPLOYMENT_MODE}"
   echo "DEPLOYMENT_STATE=${DEPLOYMENT_STATE}"
   if [[ "$STATUS" == "ERROR" ]]; then
-    echo "NEXT_REQUIRED_INPUT=${COMMON_NEXT_REQUIRED_INPUT:-run inside corporate network}"
+    echo "NEXT_REQUIRED_INPUT=${COMMON_NEXT_REQUIRED_INPUT:-required input}"
     exit 1
   fi
   [[ "$STATUS" == "OK" ]]
@@ -428,7 +422,7 @@ emit_report() {
 
 load_skill_env
 
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 BRANCH=""
 JOB_NAME_ARG=""
@@ -449,8 +443,6 @@ ARGOCD_PROJECT="${ARGOCD_PROJECT:-}"
 ARGOCD_DESTINATION_SERVER="${ARGOCD_DESTINATION_SERVER:-}"
 ARGOCD_DESTINATION_NAMESPACE="${ARGOCD_DESTINATION_NAMESPACE:-}"
 ENVIRONMENT="ift"
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
-EXECUTION_ENVIRONMENT_CLI=""
 JENKINS_BRANCH_PARAM="BRANCH"
 JENKINS_VERSION_PARAM="VERSION"
 JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
@@ -458,7 +450,6 @@ JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --self-test) run_self_tests; exit 0 ;;
-    --execution-environment) require_value "$1" "${2:-}"; EXECUTION_ENVIRONMENT_CLI="$2"; shift 2 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
@@ -489,13 +480,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ -n "$EXECUTION_ENVIRONMENT_CLI" ]]; then
-  EXECUTION_ENVIRONMENT="$EXECUTION_ENVIRONMENT_CLI"
-fi
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
+resolve_project_name
+resolve_branch
 
 if [[ -n "$DISTRIBUTION_TYPE" ]]; then
   raw_distribution_type="$DISTRIBUTION_TYPE"
@@ -508,10 +494,6 @@ apply_ift_defaults
 
 COMMON_INPUT_MISSING=false
 COMMON_NEXT_REQUIRED_INPUT=""
-if [[ -z "$PROJECT_NAME" ]]; then
-  COMMON_INPUT_MISSING=true
-  COMMON_NEXT_REQUIRED_INPUT="project name"
-fi
 
 JENKINS_PREFLIGHT=NOT_RUN
 JENKINS_LOOKUP=NOT_RUN
@@ -555,9 +537,6 @@ fi
 
 render_config_values
 
-if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-  corporate_environment_required_exit
-fi
 
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT

@@ -31,9 +31,9 @@ usage() {
 Usage:
   JENKINS_USER=<user> JENKINS_TOKEN=<token> \
   bash scripts/jenkins-build.sh \
-    --jenkins-url <url> \
-    --project-name <name> \
-    --branch <branch> \
+    [--jenkins-url <url>] \
+    [--project-name <name>] \
+    [--branch <branch>] \
     [--job-name <job-name>] \
     [--template-job <job-name>] \
     [--distribution-type <ift|release>] \
@@ -48,12 +48,10 @@ Usage:
     [--recovery-window-seconds <number>] \
     [--timeout-seconds <number>]
 
-Required arguments:
-  --jenkins-url        Jenkins base or folder URL
-  --project-name       Project name used to find/create Jenkins job
-  --branch             Branch passed to Jenkins as BRANCH
-
 Optional arguments:
+  --jenkins-url        Jenkins base or folder URL. Defaults to JENKINS_URL from skill .env.
+  --project-name       Project name used to find/create Jenkins job. Defaults to git root/current directory name.
+  --branch             Branch passed to Jenkins as BRANCH. Defaults to current git branch.
   --job-name           Explicit Jenkins job name checked before generated candidates
   --template-job       Template job name, required when project job is missing
   --distribution-type  Distributive type: ift|release, aliases: test/testing/prod/production
@@ -101,8 +99,6 @@ emit_common() {
   echo "JENKINS_PARAMETER_BRANCH=${JENKINS_BRANCH_PARAM:-}"
   echo "JENKINS_PARAMETER_VERSION=${JENKINS_VERSION_PARAM:-}"
   echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_DISTRIBUTION_TYPE_PARAM:-}"
-  echo "EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
-  echo "CHILD_EXECUTION_ENVIRONMENT=${EXECUTION_ENVIRONMENT:-local}"
   echo "MUTATIONS_PERFORMED=${MUTATIONS_PERFORMED:-false}"
 }
 
@@ -122,7 +118,7 @@ sanitize_technical_reason() {
   sed -E 's#(https?://)[^/@[:space:]]+:[^/@[:space:]]+@#\1***:***@#g; s#(--user[[:space:]]+)[^[:space:]]+#\1***#g'
 }
 
-is_corporate_network_error() {
+is_network_error() {
   case "$1" in
     *"Could not resolve host"*|*"Failed to connect"*|*"Connection refused"*|*"timed out"*|*"Timeout"*|*"timeout"*|*"SSL_ERROR_SYSCALL"*|*"SSL_connect"*|*"TLS"*|*"No route to host"*|*"Host is down"*|*"Network is unreachable"*|*"Connection reset"*)
       return 0
@@ -131,23 +127,13 @@ is_corporate_network_error() {
   esac
 }
 
-corporate_environment_required_exit() {
-  echo "STATUS=ERROR"
-  echo "STATE=corporate_environment_required"
-  echo "REASON=This operation requires corporate network access"
-  NEXT_REQUIRED_INPUT="run inside corporate network"
-  emit_common
-  echo "MUTATIONS_PERFORMED=false"
-  exit 1
-}
-
-corporate_network_unavailable_exit() {
+jenkins_unreachable_exit() {
   local technical_reason="$1"
   technical_reason="$(printf '%s' "$technical_reason" | sanitize_technical_reason)"
   echo "STATUS=ERROR"
-  echo "STATE=corporate_network_unavailable"
-  echo "REASON=Corporate service is unreachable from the current environment"
-  NEXT_REQUIRED_INPUT="run inside corporate network"
+  echo "STATE=jenkins_unreachable"
+  echo "REASON=Unable to connect to Jenkins"
+  NEXT_REQUIRED_INPUT="Jenkins access"
   emit_common
   echo "MUTATIONS_PERFORMED=false"
   [[ -n "$technical_reason" ]] && echo "TECHNICAL_REASON=${technical_reason}"
@@ -156,6 +142,28 @@ corporate_network_unavailable_exit() {
 
 warn() {
   echo "WARNING=$*"
+}
+
+resolve_project_name() {
+  if [[ -n "$PROJECT_NAME" ]]; then
+    return 0
+  fi
+  local git_root
+  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  if [[ -n "$git_root" ]]; then
+    PROJECT_NAME="$(basename "$git_root")"
+  else
+    PROJECT_NAME="$(basename "$(pwd)")"
+  fi
+  [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
+}
+
+resolve_branch() {
+  if [[ -n "$BRANCH" ]]; then
+    return 0
+  fi
+  BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
 }
 
 normalize_distribution_type() {
@@ -557,8 +565,8 @@ curl_http() {
   if ! status="$(curl --silent --show-error --output "$body_file" --dump-header "$headers_file" --write-out '%{http_code}' "$@" 2>"$ERROR_FILE")"; then
     local message
     message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
-    if is_corporate_network_error "$message"; then
-      corporate_network_unavailable_exit "$message"
+    if is_network_error "$message"; then
+      jenkins_unreachable_exit "$message"
     fi
     status="000"
   fi
@@ -574,8 +582,8 @@ curl_download() {
     local message
     message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
     [[ -n "$message" ]] || message="curl failed"
-    if is_corporate_network_error "$message"; then
-      corporate_network_unavailable_exit "$message"
+    if is_network_error "$message"; then
+      jenkins_unreachable_exit "$message"
     fi
     error_exit "${message}" "Jenkins access"
   fi
@@ -1311,7 +1319,6 @@ EOF
       JENKINS_USER=dummy \
       JENKINS_TOKEN=dummy \
       bash "$0" \
-        --execution-environment corporate \
         --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
         --project-name test-project \
         --branch develop \
@@ -1372,7 +1379,6 @@ EOF
       JENKINS_USER=dummy \
       JENKINS_TOKEN=dummy \
       bash "$0" \
-        --execution-environment corporate \
         --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
         --project-name test-project \
         --branch develop \
@@ -1395,7 +1401,6 @@ EOF
       JENKINS_USER=dummy \
       JENKINS_TOKEN=dummy \
       bash "$0" \
-        --execution-environment corporate \
         --jenkins-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI" \
         --project-name test-project \
         --branch develop \
@@ -1542,7 +1547,7 @@ wait_for_build() {
   done
 }
 
-JENKINS_URL=""
+JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
 BRANCH=""
 TEMPLATE_JOB=""
@@ -1561,7 +1566,6 @@ DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
 RECOVERY_WINDOW_SECONDS=3600
-EXECUTION_ENVIRONMENT="${EXECUTION_ENVIRONMENT:-local}"
 ACTION=""
 JOB_NAME=""
 JOB_URL=""
@@ -1678,11 +1682,6 @@ while [[ $# -gt 0 ]]; do
       RECOVERY_WINDOW_SECONDS="$2"
       shift 2
       ;;
-    --execution-environment)
-      require_value "$1" "${2:-}"
-      EXECUTION_ENVIRONMENT="$2"
-      shift 2
-      ;;
     --help|-h)
       usage
       exit 0
@@ -1693,13 +1692,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -n "$JENKINS_URL" ]] || error_exit "Missing required argument: --jenkins-url" "Jenkins URL"
-[[ -n "$PROJECT_NAME" ]] || error_exit "Missing required argument: --project-name" "project name"
-[[ -n "$BRANCH" ]] || error_exit "Missing required argument: --branch" "branch"
-case "$EXECUTION_ENVIRONMENT" in
-  local|corporate) ;;
-  *) error_exit "Unsupported execution environment: ${EXECUTION_ENVIRONMENT}" "local or corporate" ;;
-esac
+[[ -n "$JENKINS_URL" ]] || error_exit "Missing Jenkins URL" "JENKINS_URL"
+resolve_project_name
+resolve_branch
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
 [[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--recovery-window-seconds must be a number" "recovery window seconds"
 if [[ "$SKIP_LOOKUP" == "true" && -z "$JOB_NAME_ARG" ]]; then
@@ -1734,9 +1729,6 @@ if [[ "$DRY_RUN" == "true" ]]; then
   resolve_version
   ACTION="dry-run"
 else
-  if [[ "$EXECUTION_ENVIRONMENT" != "corporate" ]]; then
-    corporate_environment_required_exit
-  fi
   if [[ "$SKIP_LOOKUP" == "true" ]]; then
     JOB_NAME="$JOB_NAME_ARG"
     JOB_URL="$(job_url_for "$JOB_NAME")"

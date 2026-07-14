@@ -12,6 +12,7 @@ ALLOWED_PLACEHOLDERS = {
     "ARGOCD_APP_NAME",
     "CONFIG_PATH",
     "CHARTS_PATH",
+    "IMAGE_DIGEST",
 }
 
 
@@ -48,4 +49,3 @@ def render_path(template: str, values: dict[str, str]) -> str:
     rendered = render_template(template, values)
     validate_relative_path(rendered)
     return rendered
-
