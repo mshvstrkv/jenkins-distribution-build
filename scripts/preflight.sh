@@ -350,10 +350,10 @@ emit_report() {
   DEPLOYMENT_MODE=unknown
   DEPLOYMENT_STATE=UNKNOWN
   if [[ "$GITOPS_PREFLIGHT" == "OK" && "$ARGO_PREFLIGHT" == "OK" ]]; then
-    local mode_pair
-    mode_pair="$(deployment_mode_from_values "$CONFIG_EXISTS" "$ARGOCD_APP_EXISTS")"
-    DEPLOYMENT_MODE="${mode_pair%%:*}"
-    DEPLOYMENT_STATE="${mode_pair#*:}"
+    local deployment_pair
+    deployment_pair="$(deployment_mode_from_values "$CONFIG_EXISTS" "$ARGOCD_APP_EXISTS")"
+    DEPLOYMENT_MODE="${deployment_pair%%:*}"
+    DEPLOYMENT_STATE="${deployment_pair#*:}"
     if [[ "$DEPLOYMENT_STATE" == "ERROR" && "$STATUS" == "OK" ]]; then
       STATUS=PARTIAL
       PREFLIGHT_RESULT=FAILED

@@ -61,6 +61,15 @@ After loading this skill, the first executable command must be one of:
 
 Choose the command based only on the user request.
 
+For the request "Собери новый IFT-дистрибутив текущего проекта через Jenkins", the first command must be:
+
+```bash
+scripts/distribution build \
+  --project-dir "<current application repository>" \
+  --distribution-type ift \
+  --wait
+```
+
 The wrapper path must be resolved relative to the skill `<base_dir>`, not relative to the current application repository.
 
 Before the first wrapper invocation, the agent must not:
@@ -76,6 +85,8 @@ Before the first wrapper invocation, the agent must not:
 - run Maven, Gradle, or Docker
 - run wrapper `--help`
 - run wrapper `--dry-run`
+- inspect OS as an environment signal
+- run network checks
 - create task files, plan files, or todo lists
 - check whether `scripts/distribution` exists inside the application repository
 - read implementation wrapper files
@@ -196,9 +207,12 @@ Use these commands:
 - full delivery: `scripts/distribution deploy --project-dir "$PWD"`
 - delivery of an already completed Jenkins build: `scripts/distribution deploy-existing --project-dir "$PWD"`
 - Jenkins-only build: `scripts/distribution build --project-dir "$PWD"`
+- skill version: `scripts/distribution version`
+- skill changelog: `scripts/distribution changelog`
+- skill diagnostics: `scripts/distribution doctor`
 - exact Jenkins build status: `scripts/distribution status`
 - exact Jenkins image digest resolution: `scripts/distribution digest`
-- version resolution: `scripts/distribution version`
+- distributive version resolution: `scripts/distribution resolve-version`
 - failure analysis: `scripts/distribution analyze`
 - GitOps read-only check: `scripts/distribution gitops-check`
 - GitOps mutation stage: `scripts/distribution gitops-update`
@@ -210,6 +224,31 @@ The skill must not reproduce CLI business logic.
 The skill must not call `curl`, `git`, or `argocd` directly.
 
 The skill must pass arguments to the CLI and report machine output.
+
+## Skill Version Policy
+
+`VERSION` in the skill root is the only source of truth for the skill version.
+
+The format must be:
+
+`MAJOR.MINOR.PATCH`
+
+After every behavior change to the skill:
+- increment `VERSION`
+- describe the change in `CHANGELOG.md`
+
+Changing behavior without changing `VERSION` is forbidden.
+
+Changing `VERSION` without updating `CHANGELOG.md` is forbidden.
+
+Changing `CHANGELOG.md` without updating `VERSION` is forbidden.
+
+Public entrypoints must emit `SKILL_VERSION=<VERSION>` before any build, deploy, deploy-existing, or preflight action.
+
+Use:
+- `scripts/distribution version` to report the skill version
+- `scripts/distribution changelog` to show the latest changelog entries
+- `scripts/distribution doctor` to inspect the local skill installation
 
 ## No-Question Execution Policy
 
@@ -457,7 +496,11 @@ Do not use `snapshot`.
 
 The agent must never calculate distributive versions.
 
-Version resolution belongs to `scripts/distribution version`, which delegates to `scripts/version-resolver.sh`.
+Distributive version resolution belongs to wrappers and delegates to `scripts/version-resolver.sh`.
+
+When a public CLI call is needed only for distributive version resolution, use:
+
+`scripts/distribution resolve-version`
 
 Full delivery invokes version resolution before Jenkins build and passes the resolved `--version` to the build wrapper.
 
@@ -501,24 +544,34 @@ Execute wrappers directly.
 
 Do not run `--help` or `--dry-run` before the real wrapper command.
 
-## Network Handling Policy
+## Environment Policy
 
-This skill is intended to run in the internal environment where Jenkins, GitOps, and Argo CD are reachable.
+This skill assumes execution in its intended enterprise environment.
 
-The agent must not determine network availability independently.
+The agent must not inspect, infer, classify, or discuss network environment or infrastructure state.
 
-Do not run custom network checks.
+The agent must never claim that execution is outside the enterprise environment.
 
-Do not ask the user to classify or describe the network.
+Network and service errors are reported only from wrapper machine output.
 
-If a wrapper reports that Jenkins is unreachable, stop and report wrapper output:
+The agent must never infer or claim that:
+- Jenkins is unavailable
+- Jenkins is inaccessible
+- credentials are invalid
+- VPN is required
+- proxy blocks the request
+- firewall blocks the request
+- DNS is unavailable
+- TLS failed because of environment
+
+These statements are allowed only when returned directly by wrapper machine output.
+
+For wrapper errors, report exact:
 - `STATE`
 - `REASON`
 - `NEXT_REQUIRED_INPUT`
 
-Do not diagnose proxy settings, certificates, hostnames, or trust stores.
-
-Do not retry with insecure options such as `curl -k`.
+Do not add network explanations.
 
 ## Validation Policy
 
@@ -554,6 +607,7 @@ Preflight checks:
 - deployment state
 
 If wrappers return `STATUS=ERROR`, stop immediately and report:
+- `STATUS`
 - `STATE`
 - `REASON`
 - `NEXT_REQUIRED_INPUT`
@@ -568,7 +622,7 @@ Do not retry using undocumented or internal CLI flags.
 
 The agent must never infer or invent wrapper arguments after an error.
 
-Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, proxy inspection, certificate inspection, or hostname substitution.
+Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, certificate inspection, or hostname substitution.
 
 ## Preflight Policy
 
@@ -720,18 +774,29 @@ If Argo authentication fails, report only wrapper `REASON` and `NEXT_REQUIRED_IN
 
 If any wrapper returns `STATUS=ERROR`:
 - stop immediately
+- report exact machine fields only
+- report `STATUS`
+- report `STATE`
 - report `REASON`
 - report `NEXT_REQUIRED_INPUT`
+- do not diagnose network or service access independently
+- do not infer Jenkins availability
+- do not infer Jenkins accessibility
+- do not infer credential validity
+- do not infer proxy, firewall, DNS, TLS, or VPN causes
 - do not read wrapper source
 - do not inspect wrapper usage
 - do not retry with different arguments
 - do not infer wrapper arguments
+- do not change Jenkins URL
 - do not check env manually
 - do not run `echo JENKINS_USER`
 - do not run `echo JENKINS_TOKEN`
+- do not ask for tokens
 - do not inspect repository
 - do not switch to curl
 - do not suggest Maven, Gradle, Docker, or local build
+- do not suggest changing machines or access paths
 
 ## Hard Restrictions
 
@@ -766,6 +831,57 @@ Do not claim a Jenkins build started unless wrapper output contains:
 - non-empty `QUEUE_URL` or non-empty `BUILD_URL`
 
 If a wrapper returns an error before trigger, report only the wrapper error fields.
+
+HTTP 405 means HTTP method or URL usage only.
+
+The agent must never interpret HTTP 405 as an environment or network classification signal.
+
+If wrapper output contains `STATE=jenkins_invalid_queue_url`, report the wrapper error and do not retry with custom URLs.
+
+Do not claim a build started without a valid `QUEUE_URL`.
+
+Show users only `JOB_URL` on the configured Jenkins host as the Jenkins job link.
+
+Jenkins API redirects are internal wrapper details and must not be shown as user-facing links.
+
+Wrapper-output regression fixtures:
+
+HTTP method or URL error:
+
+```text
+STATUS=ERROR
+STATE=jenkins_invalid_queue_url
+HTTP_STATUS=405
+```
+
+Expected agent behavior:
+- report the wrapper fields exactly
+- add no environment explanation
+
+Handshake failure:
+
+```text
+STATUS=ERROR
+STATE=jenkins_unreachable
+REASON=TLS handshake failed
+```
+
+Expected agent behavior:
+- report the exact `REASON`
+- add no environment explanation
+
+Timeout:
+
+```text
+STATUS=ERROR
+STATE=build_wait_timeout
+REASON=Timed out waiting for Jenkins build result
+NEXT_REQUIRED_INPUT=more time or Jenkins build inspection
+```
+
+Expected agent behavior:
+- report timeout only
+- add no environment explanation
 
 For successful delivery, report:
 - project
