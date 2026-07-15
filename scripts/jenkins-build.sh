@@ -44,9 +44,10 @@ Usage:
     [--jenkins-url <url>] \
     [--project-name <name>] \
     [--project-dir <path>] \
-    [--branch <branch>] \
-    [--job-name <job-name>] \
-    [--template-job <job-name>] \
+	    [--branch <branch>] \
+	    [--job-name <job-name>] \
+	    [--job-url <url>] \
+	    [--template-job <job-name>] \
     [--repository-url <url>] \
     [--distribution-type <ift|release>] \
     [--version <version>] \
@@ -54,7 +55,9 @@ Usage:
     [--jenkins-branch-param <name>] \
     [--jenkins-version-param <name>] \
     [--jenkins-distribution-type-param <name>] \
-    [--skip-lookup] \
+	    [--skip-lookup] \
+	    [--existing-job] \
+	    [--create-if-missing] \
     [--dry-run] \
     [--wait] \
     [--recovery-window-seconds <number>] \
@@ -65,16 +68,19 @@ Optional arguments:
   --project-name       Project name used to find/create Jenkins job. Defaults to git root/current directory name from --project-dir.
   --project-dir        Application repository directory used to resolve project name, branch, and repository URL.
   --branch             Branch passed to Jenkins as BRANCH. Defaults to current git branch in --project-dir.
-  --job-name           Explicit Jenkins job name checked before generated candidates
-  --template-job       Template job name, defaults to JENKINS_TEMPLATE_JOB from skill .env when project job is missing
+	  --job-name           Explicit Jenkins job name checked before generated candidates
+	  --job-url            Exact Jenkins job URL to use with --job-name and --skip-lookup
+	  --template-job       Template job name, defaults to JENKINS_TEMPLATE_JOB from skill .env when project job is missing
   --repository-url     Repository URL for rendering a new job config. Defaults to git remote origin in --project-dir.
   --distribution-type  Distributive type: ift|release, aliases: test/testing/prod/production
   --version            Explicit distributive version
   --version-source     Version source hint: auto or manual
   --jenkins-branch-param             Jenkins branch parameter name, default BRANCH
   --jenkins-version-param            Jenkins version parameter name, default VERSION
-  --jenkins-distribution-type-param  Jenkins distribution type parameter name, default DISTRIBUTION_TYPE
-  --skip-lookup        Use the explicit --job-name without running Jenkins job lookup
+	  --jenkins-distribution-type-param  Jenkins distribution type parameter name, default DISTRIBUTION_TYPE
+	  --skip-lookup        Use the explicit --job-name without running Jenkins job lookup
+	  --existing-job       Verify and build an existing --job-name; forbids --template-job and createItem
+	  --create-if-missing  Create --job-name from --template-job after lookup proved the job is missing
   --dry-run            Print intended actions without changing Jenkins
   --wait               Wait until the queued build completes
   --recovery-window-seconds  Completed build recovery window, default 3600
@@ -94,6 +100,8 @@ emit_common() {
   echo "BRANCH=${BRANCH:-}"
   echo "REPOSITORY_URL=${REPOSITORY_URL:-}"
   echo "JOB_CREATED=${JOB_CREATED:-false}"
+  echo "JOB_EXISTS=${JOB_EXISTS:-false}"
+  echo "JOB_MODE=${JOB_MODE:-}"
   echo "REQUESTED_JOB_NAME=${REQUESTED_JOB_NAME:-}"
   echo "CREATED_JOB_NAME=${CREATED_JOB_NAME:-}"
   echo "JOB_NAME_SOURCE=${JOB_NAME_SOURCE:-}"
@@ -113,6 +121,7 @@ emit_common() {
   echo "REPOSITORY_MISMATCH_PATHS=${REPOSITORY_MISMATCH_PATHS:-}"
   echo "PIPELINE_SCM_BRANCH_SPEC=${PIPELINE_SCM_BRANCH_SPEC:-}"
   echo "WARNING=${WARNING:-}"
+  echo "HTTP_STATUS=${HTTP_STATUS:-}"
   echo "CREATED_JOB_REQUIRES_REVIEW=${CREATED_JOB_REQUIRES_REVIEW:-false}"
   echo "EXPECTED_REPOSITORY_URL=${EXPECTED_REPOSITORY_URL:-}"
   echo "ACTUAL_REPOSITORY_URL=${ACTUAL_REPOSITORY_URL:-}"
@@ -654,6 +663,48 @@ curl_download() {
   fi
 }
 
+download_jenkins_config_xml() {
+  local output_file="$1"
+  local current_url="$2"
+  local status location next_url redirect_count=0
+
+  while true; do
+    status="$(curl_http "$output_file" "$HEADERS_FILE" \
+      --request GET \
+      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+      "$current_url")"
+    HTTP_STATUS="$status"
+
+    case "$status" in
+      200)
+        if [[ ! -s "$output_file" ]]; then
+          job_config_unavailable_exit "Jenkins job config.xml response is empty" "$status"
+        fi
+        return 0
+        ;;
+      301|302|303|307|308)
+        location="$(header_location "$HEADERS_FILE")"
+        [[ -n "$location" ]] || job_config_unavailable_exit "Jenkins job config.xml redirect did not include Location" "$status"
+        next_url="$(absolute_url "$current_url" "$location")"
+        if ! approved_jenkins_redirect_url "$next_url"; then
+          job_config_unavailable_exit "Jenkins job config.xml redirected to an unapproved host" "$status"
+        fi
+        current_url="$next_url"
+        redirect_count=$((redirect_count + 1))
+        if (( redirect_count > 5 )); then
+          job_config_unavailable_exit "Jenkins job config.xml redirected too many times" "$status"
+        fi
+        ;;
+      401|403)
+        error_exit "Jenkins access denied while reading job config.xml: HTTP ${status}" "valid Jenkins credentials"
+        ;;
+      *)
+        job_config_unavailable_exit "Failed to read Jenkins job config.xml: HTTP ${status}" "$status"
+        ;;
+    esac
+  done
+}
+
 xml_first_repository_url() {
   local xml_file="$1"
   python3 - "$xml_file" <<'PY'
@@ -747,6 +798,23 @@ parameter_mismatch_exit() {
 
 script_path_mismatch_exit() {
   job_verification_exit "jenkins_created_job_script_path_mismatch" "$1" "review created Jenkins job script path"
+}
+
+job_config_unavailable_exit() {
+  local reason="$1"
+  HTTP_STATUS="${2:-}"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "STATE=jenkins_job_config_unavailable"
+  echo "REASON=${reason}"
+  JOB_CONFIGURATION_VERIFIED=false
+  if [[ "${JOB_CREATED:-false}" == "true" ]]; then
+    CREATED_JOB_REQUIRES_REVIEW=true
+    MUTATIONS_PERFORMED=true
+  fi
+  NEXT_REQUIRED_INPUT="Jenkins job configuration access"
+  emit_common
+  exit 1
 }
 
 verify_created_config() {
@@ -1169,9 +1237,7 @@ verify_existing_job_before_build() {
   fi
   EXPECTED_REPOSITORY_URL="$REPOSITORY_URL"
 
-  curl_download "$READBACK_CONFIG_FILE" \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/config.xml"
+  download_jenkins_config_xml "$READBACK_CONFIG_FILE" "${JOB_URL}/config.xml"
 
   verify_output="${TMP_DIR}/verify-existing-job.out"
   if ! inspect_job_config "$READBACK_CONFIG_FILE" "" "$verify_output"; then
@@ -1186,6 +1252,10 @@ verify_existing_job_before_build() {
     esac
   fi
   apply_config_verification_metadata "$verify_output"
+  JOB_EXISTS=true
+  JOB_CREATED=false
+  [[ -n "$JOB_MODE" ]] || JOB_MODE="existing"
+  ACTION="existing-job-verified"
   JOB_CONFIGURATION_VERIFIED=true
 }
 
@@ -1438,11 +1508,14 @@ find_existing_job() {
       "${candidate_url}/api/json")"
 
     case "$status" in
-      200)
-        JOB_NAME="$candidate"
-        JOB_URL="$candidate_url"
-        ACTION="reused"
-        return 0
+	    200)
+	      JOB_NAME="$candidate"
+	      JOB_URL="$candidate_url"
+	      JOB_EXISTS=true
+	      JOB_CREATED=false
+	      JOB_MODE="existing"
+	      ACTION="reused"
+	      return 0
         ;;
       404)
         ;;
@@ -1466,13 +1539,15 @@ create_job_from_template() {
   JOB_NAME="${JOB_NAME_ARG:-${PROJECT_NAME}-build}"
   REQUESTED_JOB_NAME="$JOB_NAME"
   CREATED_JOB_NAME="$JOB_NAME"
-  if [[ -n "$JOB_NAME_ARG" ]]; then
-    JOB_NAME_SOURCE="explicit"
-  else
-    JOB_NAME_SOURCE="generated"
-  fi
-  JOB_URL="$(job_url_for "$JOB_NAME")"
-  EXPECTED_JOB_NAME="$JOB_NAME"
+	  if [[ -n "$JOB_NAME_ARG" ]]; then
+	    JOB_NAME_SOURCE="explicit"
+	  else
+	    JOB_NAME_SOURCE="generated"
+	  fi
+	  JOB_URL="${JOB_URL_ARG:-$(job_url_for "$JOB_NAME")}"
+	  EXPECTED_JOB_NAME="$JOB_NAME"
+	  JOB_EXISTS=false
+	  JOB_MODE="create"
 
   if [[ "$DRY_RUN" == "true" ]]; then
     ACTION="dry-run"
@@ -1522,6 +1597,7 @@ create_job_from_template() {
 	    200|201|302)
 	      ACTION="created"
 	      JOB_CREATED=true
+	      JOB_EXISTS=true
 	      MUTATIONS_PERFORMED=true
 	      ;;
     400)
@@ -1550,9 +1626,7 @@ create_job_from_template() {
       ;;
   esac
 
-  curl_download "$READBACK_CONFIG_FILE" \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/config.xml"
+  download_jenkins_config_xml "$READBACK_CONFIG_FILE" "${JOB_URL}/config.xml"
 
   verify_output="${TMP_DIR}/verify-created-job.out"
   scan_output="${TMP_DIR}/scan-created-job.out"
@@ -2189,7 +2263,7 @@ done
 mkdir -p "$(dirname "$output")"
 log="${JENKINS_JOB_CREATE_TEST_DIR}/calls.log"
 
-template_xml() {
+	template_xml() {
   if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "incompatible-template" ]]; then
     cat <<'XML'
 <project>
@@ -2270,6 +2344,22 @@ SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesConten
 </project>
 XML
   fi
+	}
+
+existing_job_xml() {
+  cat <<'XML'
+<project>
+  <displayName>ai-payments-auth</displayName>
+  <description>Build ai-payments-auth</description>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-auth.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-auth.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-auth.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
+</project>
+XML
 }
 
 if [[ "$url" == *"/crumbIssuer/api/json" ]]; then
@@ -2325,10 +2415,10 @@ if [[ "$url" == *"/api/json" ]]; then
       exit 0
       ;;
     *)
-      if [[ ! -f "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" ]]; then
-        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" ]]; then
-          printf 'readback-api\n' >>"$log"
-          printf '{"name":"ai-payments-auth-build","url":"https://example.invalid/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
+	      if [[ ! -f "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" ]]; then
+	        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-empty-config" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" ]]; then
+	          printf 'readback-api\n' >>"$log"
+	          printf '{"name":"ai-payments-auth-build","url":"https://example.invalid/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
           printf '200'
           exit 0
         fi
@@ -2362,9 +2452,20 @@ PY
   esac
 fi
 
-if [[ "$url" == *"/config.xml" ]]; then
-  printf 'readback-config\n' >>"$log"
-  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-repo-mismatch" ]]; then
+	if [[ "$url" == *"/config.xml" ]]; then
+	  printf 'readback-config\n' >>"$log"
+	  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" ]]; then
+	    existing_job_xml >"$output"
+	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-empty-config" ]]; then
+	    : >"$output"
+	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" && "$url" == https://example.invalid/* ]]; then
+	    printf 'Location: https://ci.jenkins.sberbank.ru/job/folder/job/ai-payments-auth-build/config.xml\r\n' >"$headers"
+	    : >"$output"
+	    printf '302'
+	    exit 0
+	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" ]]; then
+	    existing_job_xml >"$output"
+	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-repo-mismatch" ]]; then
     template_xml >"$output"
   elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-harmless-metadata" ]]; then
     python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
@@ -2453,9 +2554,10 @@ EOF
         --jenkins-url "https://example.invalid/job/folder" \
         --project-name ai-payments-auth \
         --project-dir "$case_dir/project" \
-        --branch develop-corp \
-        --template-job template-job \
-        --distribution-type ift \
+	        --branch develop-corp \
+	        --template-job template-job \
+	        --create-if-missing \
+	        --distribution-type ift \
         --version IFT-0.0.1 \
         "$@"
 	    )"
@@ -2491,9 +2593,9 @@ EOF
     esac
   }
 
-  run_existing_case() {
-    local scenario="$1"
-    local expected_pattern="$2"
+	  run_existing_case() {
+	    local scenario="$1"
+	    local expected_pattern="$2"
     local case_dir output rc create_count build_count
     case_dir="$tmp/$scenario"
     mkdir -p "$case_dir/project"
@@ -2508,10 +2610,11 @@ EOF
         --jenkins-url "https://example.invalid/job/folder" \
         --project-name ai-payments-auth \
         --project-dir "$case_dir/project" \
-        --branch develop-corp \
-        --job-name ai-payments-auth-build \
-        --skip-lookup \
-        --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+	        --branch develop-corp \
+	        --job-name ai-payments-auth-build \
+	        --skip-lookup \
+	        --existing-job \
+	        --repository-url ssh://git@example.org/team/ai-payments-auth.git \
         --distribution-type ift \
         --version IFT-0.0.1
     )"
@@ -2522,10 +2625,47 @@ EOF
     create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
     build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
     [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected create"; exit 1; }
-    [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected build"; exit 1; }
-  }
+	    [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected build"; exit 1; }
+	  }
 
-  run_create_case explicit-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
+	  run_existing_success_case() {
+	    local scenario="$1"
+	    local expected_pattern="$2"
+	    local case_dir output rc create_count build_count
+	    case_dir="$tmp/$scenario"
+	    mkdir -p "$case_dir/project"
+	    set +e
+	    output="$(
+	      PATH="$bin:$PATH" \
+	      JENKINS_JOB_CREATE_TEST_DIR="$case_dir" \
+	      JENKINS_JOB_CREATE_SCENARIO="$scenario" \
+	      JENKINS_TEMPLATE_JOB=template-job \
+	      JENKINS_USER=dummy \
+	      JENKINS_TOKEN=dummy \
+	      bash "$0" \
+	        --jenkins-url "https://example.invalid/job/folder" \
+	        --project-name ai-payments-auth \
+	        --project-dir "$case_dir/project" \
+	        --branch develop-corp \
+	        --job-name ai-payments-auth-build \
+	        --skip-lookup \
+	        --existing-job \
+	        --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+	        --distribution-type ift \
+	        --version IFT-0.0.1
+	    )"
+	    rc=$?
+	    set -e
+	    printf '%s\n' "$output" >"$case_dir/output"
+	    [[ $rc -eq 0 ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} expected success"; exit 1; }
+	    grep -q "$expected_pattern" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} missing ${expected_pattern}"; exit 1; }
+	    create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
+	    build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
+	    [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected create"; exit 1; }
+	    [[ "$build_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build count ${build_count}"; exit 1; }
+	  }
+
+	  run_create_case explicit-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
     --job-name ai-payments-auth-build \
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
@@ -2621,9 +2761,44 @@ EOF
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
 
-  run_existing_case existing-incompatible "STATE=jenkins_created_job_parameter_mismatch"
+	  run_existing_case existing-incompatible "STATE=jenkins_created_job_parameter_mismatch"
 
-  expected_order=$'fetch-template\ncrumb\ncreateItem\nreadback-api\nreadback-config\nbuildWithParameters'
+	  run_existing_success_case existing-compatible "JOB_CONFIGURATION_VERIFIED=true"
+	  grep -q "JOB_CREATED=false" "$tmp/existing-compatible/output" || { echo "FAIL existing job reported created"; exit 1; }
+	  grep -q "JOB_EXISTS=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job existence missing"; exit 1; }
+	  grep -q "VERSION=IFT-0.0.1" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing job trigger exact version"; exit 1; }
+	  ! grep -q "DISTRIBUTION_TYPE" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing unsupported distribution type sent"; exit 1; }
+
+	  run_existing_success_case existing-config-redirect "JOB_CONFIGURATION_VERIFIED=true"
+
+	  run_existing_case existing-empty-config "STATE=jenkins_job_config_unavailable"
+
+	  set +e
+	  output="$(
+	    PATH="$bin:$PATH" \
+	    JENKINS_JOB_CREATE_TEST_DIR="$tmp/conflicting-mode" \
+	    JENKINS_JOB_CREATE_SCENARIO=existing-compatible \
+	    JENKINS_USER=dummy \
+	    JENKINS_TOKEN=dummy \
+	    bash "$0" \
+	      --jenkins-url "https://example.invalid/job/folder" \
+	      --project-name ai-payments-auth \
+	      --project-dir "$tmp/conflicting-mode/project" \
+	      --branch develop-corp \
+	      --job-name ai-payments-auth-build \
+	      --skip-lookup \
+	      --existing-job \
+	      --template-job template-job \
+	      --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+	      --distribution-type ift \
+	      --version IFT-0.0.1
+	  )"
+	  rc=$?
+	  set -e
+	  [[ $rc -ne 0 ]] || { printf '%s\n' "$output"; echo "FAIL conflicting job mode accepted"; exit 1; }
+	  grep -q "STATE=conflicting_job_mode" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL conflicting job mode state"; exit 1; }
+
+	  expected_order=$'fetch-template\ncrumb\ncreateItem\nreadback-api\nreadback-config\nbuildWithParameters'
   actual_order="$(cat "$tmp/explicit-job-name/calls.log")"
   [[ "$actual_order" == "$expected_order" ]] || {
     printf 'Expected order:\n%s\nActual order:\n%s\n' "$expected_order" "$actual_order"
@@ -2741,7 +2916,9 @@ PROJECT_DIR="${PROJECT_DIR:-}"
 BRANCH=""
 REPOSITORY_URL=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
+TEMPLATE_JOB_EXPLICIT=false
 JOB_NAME_ARG=""
+JOB_URL_ARG=""
 DISTRIBUTION_TYPE=""
 VERSION=""
 VERSION_SOURCE=""
@@ -2752,12 +2929,16 @@ JENKINS_VERSION_PARAM="VERSION"
 JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
 RESOLVE_VERSION_ONLY=false
 SKIP_LOOKUP=false
+EXISTING_JOB=false
+CREATE_IF_MISSING=false
 DRY_RUN=false
 WAIT=false
 TIMEOUT_SECONDS=1800
 RECOVERY_WINDOW_SECONDS=3600
 ACTION=""
 JOB_CREATED=false
+JOB_EXISTS=false
+JOB_MODE=""
 JOB_NAME=""
 JOB_URL=""
 CANONICAL_JOB_URL=""
@@ -2778,6 +2959,7 @@ REPOSITORY_MISMATCH_PATHS=""
 SCRIPT_PATH=""
 PIPELINE_SCM_BRANCH_SPEC=""
 WARNING=""
+HTTP_STATUS=""
 JOB_IDENTITY_VERIFIED=false
 REQUIRED_PARAMETERS_OK=false
 REQUIRED_PARAMETERS=""
@@ -2847,16 +3029,22 @@ while [[ $# -gt 0 ]]; do
       BRANCH="$2"
       shift 2
       ;;
-    --job-name)
-      require_value "$1" "${2:-}"
-      JOB_NAME_ARG="$2"
-      shift 2
-      ;;
-    --template-job)
-      require_value "$1" "${2:-}"
-      TEMPLATE_JOB="$2"
-      shift 2
-      ;;
+	    --job-name)
+	      require_value "$1" "${2:-}"
+	      JOB_NAME_ARG="$2"
+	      shift 2
+	      ;;
+	    --job-url)
+	      require_value "$1" "${2:-}"
+	      JOB_URL_ARG="${2%/}"
+	      shift 2
+	      ;;
+	    --template-job)
+	      require_value "$1" "${2:-}"
+	      TEMPLATE_JOB="$2"
+	      TEMPLATE_JOB_EXPLICIT=true
+	      shift 2
+	      ;;
     --repository-url)
       require_value "$1" "${2:-}"
       REPOSITORY_URL="$2"
@@ -2892,10 +3080,18 @@ while [[ $# -gt 0 ]]; do
       JENKINS_DISTRIBUTION_TYPE_PARAM="$2"
       shift 2
       ;;
-    --skip-lookup)
-      SKIP_LOOKUP=true
-      shift
-      ;;
+	    --skip-lookup)
+	      SKIP_LOOKUP=true
+	      shift
+	      ;;
+	    --existing-job)
+	      EXISTING_JOB=true
+	      shift
+	      ;;
+	    --create-if-missing)
+	      CREATE_IF_MISSING=true
+	      shift
+	      ;;
     --dry-run)
       DRY_RUN=true
       shift
@@ -2931,6 +3127,23 @@ done
 [[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--recovery-window-seconds must be a number" "recovery window seconds"
 if [[ "$SKIP_LOOKUP" == "true" && -z "$JOB_NAME_ARG" ]]; then
   error_exit "--skip-lookup requires --job-name" "job name"
+fi
+if [[ "$EXISTING_JOB" == "true" && -z "$JOB_NAME_ARG" ]]; then
+  error_exit "--existing-job requires --job-name" "job name"
+fi
+if [[ "$EXISTING_JOB" == "true" && "$CREATE_IF_MISSING" == "true" ]]; then
+  STATE="conflicting_job_mode"
+  error_exit "Conflicting Jenkins job modes: --existing-job and --create-if-missing" "choose existing or create mode"
+fi
+if [[ "$EXISTING_JOB" == "true" && "$TEMPLATE_JOB_EXPLICIT" == "true" ]]; then
+  STATE="conflicting_job_mode"
+  error_exit "Conflicting Jenkins job modes: --existing-job and --template-job" "choose existing or create mode"
+fi
+if [[ "$EXISTING_JOB" == "true" ]]; then
+  TEMPLATE_JOB=""
+fi
+if [[ "$CREATE_IF_MISSING" == "true" && -z "$TEMPLATE_JOB" ]]; then
+  error_exit "--create-if-missing requires --template-job" "template job"
 fi
 raw_distribution_type="$DISTRIBUTION_TYPE"
 if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$raw_distribution_type")"; then
@@ -2970,17 +3183,27 @@ if [[ "$DRY_RUN" == "true" ]]; then
   resolve_version
   ACTION="dry-run"
 else
-  if [[ "$SKIP_LOOKUP" == "true" ]]; then
-    JOB_NAME="$JOB_NAME_ARG"
-    JOB_URL="$(job_url_for "$JOB_NAME")"
-    build_candidate_job_names
-    if [[ -n "$TEMPLATE_JOB" ]]; then
-      create_job_from_template
-    else
-      REQUESTED_JOB_NAME="$JOB_NAME"
-      JOB_NAME_SOURCE="explicit"
-      ACTION="reused"
-    fi
+	  if [[ "$SKIP_LOOKUP" == "true" ]]; then
+	    JOB_NAME="$JOB_NAME_ARG"
+	    JOB_URL="${JOB_URL_ARG:-$(job_url_for "$JOB_NAME")}"
+	    build_candidate_job_names
+	    if [[ "$EXISTING_JOB" == "true" ]]; then
+	      REQUESTED_JOB_NAME="$JOB_NAME"
+	      JOB_NAME_SOURCE="explicit"
+	      JOB_EXISTS=true
+	      JOB_CREATED=false
+	      JOB_MODE="existing"
+	      ACTION="existing-job-verified"
+	    elif [[ "$CREATE_IF_MISSING" == "true" ]]; then
+	      create_job_from_template
+	    else
+	      REQUESTED_JOB_NAME="$JOB_NAME"
+	      JOB_NAME_SOURCE="explicit"
+	      JOB_EXISTS=true
+	      JOB_CREATED=false
+	      JOB_MODE="legacy"
+	      ACTION="reused"
+	    fi
   elif ! find_existing_job; then
     if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
       error_exit "Jenkins job not found. Checked: ${CHECKED_JOB_NAMES[*]}." "existing Jenkins job"

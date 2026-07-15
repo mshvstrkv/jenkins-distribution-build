@@ -30,6 +30,33 @@ def project_dir_required() -> int:
     return 1
 
 
+INTERNAL_PUBLIC_FLAGS = {
+    "--skip-lookup",
+    "–skip-lookup",
+    "--existing-job",
+    "–existing-job",
+    "--create-if-missing",
+    "–create-if-missing",
+}
+
+
+def unsupported_public_argument(argument: str) -> int:
+    print("STATUS=ERROR")
+    print("ACTION=blocked")
+    print("STATE=unsupported_public_argument")
+    print(f"REASON=Unsupported public CLI argument: {argument}")
+    print("NEXT_REQUIRED_INPUT=documented public argument")
+    print("MUTATIONS_PERFORMED=false")
+    return 1
+
+
+def find_internal_public_argument(args: list[str]) -> str | None:
+    for arg in args:
+        if arg in INTERNAL_PUBLIC_FLAGS:
+            return arg
+    return None
+
+
 def run_wrapper(name: str, args: list[str]) -> int:
     return subprocess.call([str(SCRIPT_DIR / name), *args])
 
@@ -62,6 +89,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REASON=Unknown command: {command}")
         print("NEXT_REQUIRED_INPUT=valid command")
         return 1
+    internal_arg = find_internal_public_argument(argv)
+    if internal_arg:
+        return unsupported_public_argument(internal_arg)
     if requires_project_dir(command, argv) and not has_project_dir(argv):
         return project_dir_required()
     return run_wrapper(wrapper, argv)

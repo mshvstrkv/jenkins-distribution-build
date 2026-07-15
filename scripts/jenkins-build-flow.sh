@@ -141,7 +141,7 @@ echo "BRANCH=feature/context"
 echo "JOB_NAME=application-service-build"
 echo "JOB_URL=https://example.invalid/job/folder/job/application-service-build"
 echo "JENKINS_URL=https://example.invalid/job/folder"
-echo "EXISTS=true"
+echo "EXISTS=${JENKINS_BUILD_FLOW_LOOKUP_EXISTS:-true}"
 echo "NEXT_REQUIRED_INPUT="
 EOF
 
@@ -171,9 +171,27 @@ EOF
 #!/usr/bin/env bash
 printf 'build %s\n' "$*" >>"$JENKINS_BUILD_FLOW_TEST_LOG"
 case " $* " in
-  *" --skip-lookup "*) ;;
-  *) echo "STATUS=ERROR"; echo "REASON=missing --skip-lookup"; exit 1 ;;
-esac
+	  *" --skip-lookup "*) ;;
+	  *) echo "STATUS=ERROR"; echo "REASON=missing --skip-lookup"; exit 1 ;;
+	esac
+if [[ "${JENKINS_BUILD_FLOW_LOOKUP_EXISTS:-true}" == "true" ]]; then
+  case " $* " in
+    *" --existing-job "*) ;;
+    *) echo "STATUS=ERROR"; echo "REASON=missing --existing-job"; exit 1 ;;
+  esac
+  case " $* " in
+    *" --template-job "*) echo "STATUS=ERROR"; echo "REASON=template passed for existing job"; exit 1 ;;
+  esac
+else
+  case " $* " in
+    *" --create-if-missing "*) ;;
+    *) echo "STATUS=ERROR"; echo "REASON=missing --create-if-missing"; exit 1 ;;
+  esac
+  case " $* " in
+    *" --template-job template-job "*) ;;
+    *) echo "STATUS=ERROR"; echo "REASON=missing template for create"; exit 1 ;;
+  esac
+fi
 case " $* " in
   *" --project-name application-service "*) ;;
   *) echo "STATUS=ERROR"; echo "REASON=project name not propagated to build"; exit 1 ;;
@@ -217,8 +235,9 @@ EOF
     JENKINS_BUILD_FLOW_TEST_LOG="$log" \
     JENKINS_BUILD_FLOW_LOOKUP_WRAPPER="$tmp/lookup.sh" \
     JENKINS_BUILD_FLOW_VERSION_WRAPPER="$tmp/version.sh" \
-    JENKINS_BUILD_FLOW_BUILD_WRAPPER="$tmp/build.sh" \
-    JENKINS_USER=dummy \
+	    JENKINS_BUILD_FLOW_BUILD_WRAPPER="$tmp/build.sh" \
+	    JENKINS_TEMPLATE_JOB=template-job \
+	    JENKINS_USER=dummy \
     JENKINS_TOKEN=dummy \
     bash "$0" \
       --jenkins-url "https://example.invalid/job/folder" \
@@ -235,9 +254,36 @@ EOF
   [[ "$(sed -n '3s/ .*//p' "$log")" == "build" ]] || { echo "FAIL call sequence build"; exit 1; }
   grep -q -- "--skip-lookup" "$log" || { echo "FAIL build missing --skip-lookup"; exit 1; }
   grep -q -- "--recovery-window-seconds 120" "$log" || { echo "FAIL build missing recovery window"; exit 1; }
-  grep -q "PROJECT_NAME=application-service" <<<"$output" || { echo "FAIL project name from project dir"; exit 1; }
-  grep -q "BRANCH=feature/context" <<<"$output" || { echo "FAIL branch from project dir"; exit 1; }
-  grep -q "JOB_NAME=application-service-build" <<<"$output" || { echo "FAIL job name from project"; exit 1; }
+	  grep -q "PROJECT_NAME=application-service" <<<"$output" || { echo "FAIL project name from project dir"; exit 1; }
+	  grep -q "BRANCH=feature/context" <<<"$output" || { echo "FAIL branch from project dir"; exit 1; }
+	  grep -q "JOB_NAME=application-service-build" <<<"$output" || { echo "FAIL job name from project"; exit 1; }
+
+	  : >"$log"
+	  set +e
+	  output="$(
+	    cd "$skill_root" && \
+	    ENV_FILE=/dev/null \
+	    PROJECT_REPO="$project_repo" \
+	    JENKINS_BUILD_FLOW_LOOKUP_EXISTS=false \
+	    JENKINS_BUILD_FLOW_TEST_LOG="$log" \
+	    JENKINS_BUILD_FLOW_LOOKUP_WRAPPER="$tmp/lookup.sh" \
+	    JENKINS_BUILD_FLOW_VERSION_WRAPPER="$tmp/version.sh" \
+	    JENKINS_BUILD_FLOW_BUILD_WRAPPER="$tmp/build.sh" \
+	    JENKINS_TEMPLATE_JOB=template-job \
+	    JENKINS_USER=dummy \
+	    JENKINS_TOKEN=dummy \
+	    bash "$0" \
+	      --jenkins-url "https://example.invalid/job/folder" \
+	      --project-dir "$project_repo" \
+	      --distribution-type ift \
+	      --recovery-window-seconds 120 \
+	      --wait
+	  )"
+	  rc=$?
+	  set -e
+	  [[ $rc -eq 0 ]] || { printf '%s\n' "$output"; exit 1; }
+	  grep -q -- "--create-if-missing" "$log" || { echo "FAIL missing job build missing --create-if-missing"; exit 1; }
+	  grep -q -- "--template-job template-job" "$log" || { echo "FAIL missing job build missing template"; exit 1; }
 
   set +e
   output="$(ENV_FILE=/dev/null bash "$0" --jenkins-url "https://example.invalid/job/folder" --distribution-type ift --dry-run 2>&1)"
@@ -339,9 +385,9 @@ lookup_args=(
 [[ -n "$JOB_NAME_ARG" ]] && lookup_args+=(--job-name "$JOB_NAME_ARG")
 [[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
 run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
-JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
-JOB_URL="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
-LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
+	JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
+	JOB_URL="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
+	LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
 if [[ "$LOOKUP_EXISTS" == "false" && -z "$VERSION" ]]; then
@@ -372,21 +418,24 @@ build_args=(
   --project-name "$PROJECT_NAME"
   --project-dir "$PROJECT_DIR"
   --branch "$BRANCH"
-  --job-name "$JOB_NAME"
-  --skip-lookup
-  --distribution-type "$DISTRIBUTION_TYPE"
+	  --job-name "$JOB_NAME"
+	  --job-url "$JOB_URL"
+	  --skip-lookup
+	  --distribution-type "$DISTRIBUTION_TYPE"
   --version "$VERSION"
   --jenkins-branch-param "$JENKINS_BRANCH_PARAM"
   --jenkins-version-param "$JENKINS_VERSION_PARAM"
   --jenkins-distribution-type-param "$JENKINS_DISTRIBUTION_TYPE_PARAM"
   --recovery-window-seconds "$RECOVERY_WINDOW_SECONDS"
   --timeout-seconds "$TIMEOUT_SECONDS"
-)
-if [[ "$LOOKUP_EXISTS" == "false" ]]; then
-  [[ -n "$TEMPLATE_JOB" ]] || flow_error "Template job is required to create missing Jenkins job" "template job"
-  build_args+=(--template-job "$TEMPLATE_JOB")
-  [[ -n "$REPOSITORY_URL" ]] && build_args+=(--repository-url "$REPOSITORY_URL")
-fi
+	)
+	if [[ "$LOOKUP_EXISTS" == "false" ]]; then
+	  [[ -n "$TEMPLATE_JOB" ]] || flow_error "Template job is required to create missing Jenkins job" "template job"
+	  build_args+=(--template-job "$TEMPLATE_JOB" --create-if-missing)
+	  [[ -n "$REPOSITORY_URL" ]] && build_args+=(--repository-url "$REPOSITORY_URL")
+	else
+	  build_args+=(--existing-job)
+	fi
 [[ "$WAIT" == "true" ]] && build_args+=(--wait)
 run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
 

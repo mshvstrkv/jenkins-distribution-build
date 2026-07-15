@@ -755,9 +755,10 @@ lookup_args=(
 )
 [[ -n "$JOB_NAME" ]] && lookup_args+=(--job-name "$JOB_NAME")
 [[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
-run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
-JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
-LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
+	run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
+	JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
+	JOB_URL="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
+	LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
 if [[ "$LOOKUP_EXISTS" == "false" && -z "$VERSION" ]]; then
@@ -794,13 +795,15 @@ build_args=(
   --jenkins-version-param "$JENKINS_VERSION_PARAM"
   --jenkins-distribution-type-param "$JENKINS_DISTRIBUTION_TYPE_PARAM"
   --wait
-)
-[[ -n "$JOB_NAME" ]] && build_args+=(--job-name "$JOB_NAME")
-[[ -n "$JOB_NAME" ]] && build_args+=(--skip-lookup)
-if [[ "$LOOKUP_EXISTS" == "false" ]]; then
-  [[ -n "$TEMPLATE_JOB" ]] || error_exit "Template job is required to create missing Jenkins job" "template job"
-  build_args+=(--template-job "$TEMPLATE_JOB")
-fi
+	)
+	[[ -n "$JOB_NAME" ]] && build_args+=(--job-name "$JOB_NAME" --skip-lookup)
+	[[ -n "$JOB_URL" ]] && build_args+=(--job-url "$JOB_URL")
+	if [[ "$LOOKUP_EXISTS" == "false" ]]; then
+	  [[ -n "$TEMPLATE_JOB" ]] || error_exit "Template job is required to create missing Jenkins job" "template job"
+	  build_args+=(--template-job "$TEMPLATE_JOB" --create-if-missing)
+	else
+	  build_args+=(--existing-job)
+	fi
 [[ -n "$VERSION" ]] && build_args+=(--version "$VERSION")
 [[ -n "$REPOSITORY_URL" ]] && build_args+=(--repository-url "$REPOSITORY_URL")
 [[ "$DRY_RUN" == "true" ]] && build_args+=(--dry-run)

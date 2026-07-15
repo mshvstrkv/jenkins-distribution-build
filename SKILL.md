@@ -230,6 +230,10 @@ Do not:
 - read `.env`
 - print `.env`
 - extract credentials from `.env` into a shell command
+- ask for `JENKINS_TOKEN`
+- ask for a Jenkins API token
+- propose direct `curl` or Jenkins API calls
+- retry with inferred low-level wrapper arguments
 
 The wrappers load skill-root `.env` themselves.
 
@@ -549,6 +553,14 @@ If wrappers return `STATUS=ERROR`, stop immediately and report:
 - `NEXT_REQUIRED_INPUT`
 
 Do not propose manual Jenkins identity confirmation after wrapper errors.
+
+Do not ask the user to send Jenkins credentials in chat.
+
+Do not assume wrappers are missing credentials; wrappers load credentials internally from `.env`.
+
+Do not retry using undocumented or internal CLI flags.
+
+The agent must never infer or invent wrapper arguments after an error.
 
 Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, proxy inspection, certificate inspection, or hostname substitution.
 
