@@ -86,21 +86,60 @@ print(resolve_version(sys.argv[1], []).version)
 PY
 }
 
+
 run_flow_self_tests() {
-  local tmp log output rc
+  local tmp log output rc project_repo skill_root
   tmp="$(mktemp -d)"
   log="$tmp/calls.log"
+  project_repo="$tmp/application-service"
+  skill_root="$(cd "$SCRIPT_DIR/.." && pwd)"
   trap 'rm -rf "$tmp"' RETURN
+
+  mkdir -p "$project_repo"
+  git -C "$project_repo" init >/dev/null
+  git -C "$project_repo" config user.email test@example.com
+  git -C "$project_repo" config user.name 'Test User'
+  printf 'app\n' >"$project_repo/README.md"
+  git -C "$project_repo" add README.md
+  git -C "$project_repo" commit -m initial >/dev/null
+  git -C "$project_repo" checkout -b feature/context >/dev/null
+  git -C "$project_repo" remote add origin ssh://git@example.org/team/application-service.git
+
+  PROJECT_DIR="$project_repo"
+  PROJECT_NAME=""
+  BRANCH=""
+  REPOSITORY_URL=""
+  resolve_project_name
+  resolve_branch
+  resolve_repository_url
+  [[ "$PROJECT_NAME" == "application-service" ]] || { echo "FAIL project name resolver"; exit 1; }
+  [[ "$BRANCH" == "feature/context" ]] || { echo "FAIL branch resolver"; exit 1; }
+  [[ "$REPOSITORY_URL" == "ssh://git@example.org/team/application-service.git" ]] || { echo "FAIL repository resolver"; exit 1; }
+  PROJECT_NAME=""
+  BRANCH=""
+  REPOSITORY_URL=""
 
   cat >"$tmp/lookup.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'lookup %s\n' "$*" >>"$JENKINS_BUILD_FLOW_TEST_LOG"
+case " $* " in
+  *" --project-name application-service "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=wrong project name"; exit 1 ;;
+esac
+case " $* " in
+  *" --project-dir $PROJECT_REPO "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=wrong project dir"; exit 1 ;;
+esac
+case " $* " in
+  *" --branch feature/context "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=wrong branch"; exit 1 ;;
+esac
 echo "STATUS=OK"
 echo "ACTION=lookup"
-echo "PROJECT_NAME=test-project"
-echo "BRANCH=develop"
-echo "JOB_NAME=test-project-build"
-echo "JOB_URL=https://example.invalid/job/folder/job/test-project-build"
+echo "PROJECT_NAME=application-service"
+echo "BRANCH=feature/context"
+echo "JOB_NAME=application-service-build"
+echo "JOB_URL=https://example.invalid/job/folder/job/application-service-build"
 echo "JENKINS_URL=https://example.invalid/job/folder"
 echo "EXISTS=true"
 echo "NEXT_REQUIRED_INPUT="
@@ -109,9 +148,17 @@ EOF
   cat >"$tmp/version.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'version %s\n' "$*" >>"$JENKINS_BUILD_FLOW_TEST_LOG"
+case " $* " in
+  *" --project-name application-service "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=project name not propagated to version"; exit 1 ;;
+esac
+case " $* " in
+  *" --project-dir $PROJECT_REPO "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=project dir not propagated to version"; exit 1 ;;
+esac
 echo "STATUS=OK"
 echo "ACTION=resolve-version"
-echo "PROJECT_NAME=test-project"
+echo "PROJECT_NAME=application-service"
 echo "DISTRIBUTION_TYPE=ift"
 echo "PREVIOUS_VERSION="
 echo "VERSION=IFT-0.0.1"
@@ -127,19 +174,35 @@ case " $* " in
   *" --skip-lookup "*) ;;
   *) echo "STATUS=ERROR"; echo "REASON=missing --skip-lookup"; exit 1 ;;
 esac
+case " $* " in
+  *" --project-name application-service "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=project name not propagated to build"; exit 1 ;;
+esac
+case " $* " in
+  *" --project-dir $PROJECT_REPO "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=project dir not propagated to build"; exit 1 ;;
+esac
+case " $* " in
+  *" --branch feature/context "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=branch not propagated to build"; exit 1 ;;
+esac
+case " $* " in
+  *" --job-name application-service-build "*) ;;
+  *) echo "STATUS=ERROR"; echo "REASON=job name not propagated to build"; exit 1 ;;
+esac
 echo "STATUS=OK"
 echo "ACTION=reused"
-echo "PROJECT_NAME=test-project"
-echo "BRANCH=develop"
+echo "PROJECT_NAME=application-service"
+echo "BRANCH=feature/context"
 echo "JENKINS_URL=https://example.invalid/job/folder"
-echo "JOB_NAME=test-project-build"
-echo "JOB_URL=https://example.invalid/job/folder/job/test-project-build"
+echo "JOB_NAME=application-service-build"
+echo "JOB_URL=https://example.invalid/job/folder/job/application-service-build"
 echo "DISTRIBUTION_TYPE=ift"
 echo "PREVIOUS_VERSION="
 echo "VERSION=IFT-0.0.1"
 echo "VERSION_SOURCE=default"
 echo "QUEUE_URL=https://example.invalid/queue/item/1/"
-echo "BUILD_URL=https://example.invalid/job/folder/job/test-project-build/1/"
+echo "BUILD_URL=https://example.invalid/job/folder/job/application-service-build/1/"
 echo "RESULT=SUCCESS"
 echo "NEXT_REQUIRED_INPUT="
 EOF
@@ -148,6 +211,9 @@ EOF
 
   set +e
   output="$(
+    cd "$skill_root" && \
+    ENV_FILE=/dev/null \
+    PROJECT_REPO="$project_repo" \
     JENKINS_BUILD_FLOW_TEST_LOG="$log" \
     JENKINS_BUILD_FLOW_LOOKUP_WRAPPER="$tmp/lookup.sh" \
     JENKINS_BUILD_FLOW_VERSION_WRAPPER="$tmp/version.sh" \
@@ -156,10 +222,8 @@ EOF
     JENKINS_TOKEN=dummy \
     bash "$0" \
       --jenkins-url "https://example.invalid/job/folder" \
-      --project-name test-project \
-      --branch develop \
+      --project-dir "$project_repo" \
       --distribution-type ift \
-      --job-name test-project-build \
       --recovery-window-seconds 120 \
       --wait
   )"
@@ -171,15 +235,31 @@ EOF
   [[ "$(sed -n '3s/ .*//p' "$log")" == "build" ]] || { echo "FAIL call sequence build"; exit 1; }
   grep -q -- "--skip-lookup" "$log" || { echo "FAIL build missing --skip-lookup"; exit 1; }
   grep -q -- "--recovery-window-seconds 120" "$log" || { echo "FAIL build missing recovery window"; exit 1; }
-  grep -q "STATUS=OK" <<<"$output" || { echo "FAIL flow output status"; exit 1; }
+  grep -q "PROJECT_NAME=application-service" <<<"$output" || { echo "FAIL project name from project dir"; exit 1; }
+  grep -q "BRANCH=feature/context" <<<"$output" || { echo "FAIL branch from project dir"; exit 1; }
+  grep -q "JOB_NAME=application-service-build" <<<"$output" || { echo "FAIL job name from project"; exit 1; }
+
+  set +e
+  output="$(ENV_FILE=/dev/null bash "$0" --jenkins-url "https://example.invalid/job/folder" --distribution-type ift --dry-run 2>&1)"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL missing project-dir succeeded"; exit 1; }
+  grep -q "STATE=project_directory_required" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL missing project-dir state"; exit 1; }
+
+  echo "PROJECT_CONTEXT_PROPAGATED=OK"
+  echo "PROJECT_NAME_FROM_PROJECT_DIR=OK"
+  echo "REPOSITORY_FROM_PROJECT_DIR=OK"
+  echo "SKILL_DIRECTORY_NEVER_USED_AS_PROJECT=OK"
+  echo "JENKINS_JOB_FROM_PROJECT=OK"
   echo "JENKINS_BUILD_FLOW_SELF_TESTS=OK"
 }
+
 
 load_skill_env
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 BRANCH=""
 JOB_NAME_ARG=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
@@ -219,6 +299,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 resolve_jenkins_url
+require_project_dir
 resolve_project_name
 resolve_branch
 [[ -n "$DISTRIBUTION_TYPE" ]] || flow_error "Missing required argument: --distribution-type" "distribution type"

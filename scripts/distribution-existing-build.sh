@@ -126,7 +126,17 @@ run_self_tests() {
   local tmp log output
   tmp="$(mktemp -d)"
   log="$tmp/calls.log"
+  project_repo="$tmp/application-service"
   trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "$project_repo"
+  git -C "$project_repo" init >/dev/null
+  git -C "$project_repo" config user.email test@example.com
+  git -C "$project_repo" config user.name "Test User"
+  printf "app\n" >"$project_repo/README.md"
+  git -C "$project_repo" add README.md
+  git -C "$project_repo" commit -m initial >/dev/null
+  git -C "$project_repo" checkout -b develop >/dev/null
+  git -C "$project_repo" remote add origin ssh://git@example.org/team/application-service.git
   cat >"$tmp/status.sh" <<'EOF'
 #!/usr/bin/env bash
 printf 'status %s\n' "$*" >>"$DISTRIBUTION_EXISTING_TEST_LOG"
@@ -186,7 +196,7 @@ EOF
     DISTRIBUTION_EXISTING_GITOPS_UPDATE_WRAPPER="$tmp/gitops-update.sh" \
     DISTRIBUTION_EXISTING_ARGO_CHECK_WRAPPER="$tmp/argo-check.sh" \
     DISTRIBUTION_EXISTING_ARGO_SYNC_WRAPPER="$tmp/argocd-sync.sh" \
-    bash "$0" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift
+    bash "$0" --project-dir "$project_repo" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift
   )"
   grep -q "STATUS=PAUSED" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
   grep -q "NEXT_REQUIRED_INPUT=additional GitOps changes decision" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
@@ -202,7 +212,7 @@ EOF
     DISTRIBUTION_EXISTING_GITOPS_UPDATE_WRAPPER="$tmp/gitops-update.sh" \
     DISTRIBUTION_EXISTING_ARGO_CHECK_WRAPPER="$tmp/argo-check.sh" \
     DISTRIBUTION_EXISTING_ARGO_SYNC_WRAPPER="$tmp/argocd-sync.sh" \
-    bash "$0" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --no-extra-config-changes
+    bash "$0" --project-dir "$project_repo" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --no-extra-config-changes
   )"
   grep -q "STATUS=OK" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
   grep -q "ADDITIONAL_CONFIG_CHANGES=false" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
@@ -222,7 +232,7 @@ EOF
     DISTRIBUTION_EXISTING_GITOPS_UPDATE_WRAPPER="$tmp/gitops-update.sh" \
     DISTRIBUTION_EXISTING_ARGO_CHECK_WRAPPER="$tmp/argo-check.sh" \
     DISTRIBUTION_EXISTING_ARGO_SYNC_WRAPPER="$tmp/argocd-sync.sh" \
-    bash "$0" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --additional-config-changes-required
+    bash "$0" --project-dir "$project_repo" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --additional-config-changes-required
   )"
   grep -q "STATUS=PAUSED" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
   grep -q "STATE=additional_config_changes_required" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
@@ -238,7 +248,7 @@ EOF
     DISTRIBUTION_EXISTING_GITOPS_UPDATE_WRAPPER="$tmp/gitops-update.sh" \
     DISTRIBUTION_EXISTING_ARGO_CHECK_WRAPPER="$tmp/argo-check.sh" \
     DISTRIBUTION_EXISTING_ARGO_SYNC_WRAPPER="$tmp/argocd-sync.sh" \
-    bash "$0" --resume --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-extra-config-changes
+    bash "$0" --resume --project-dir "$project_repo" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --digest aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa --no-extra-config-changes
   )"
   grep -q "STATUS=OK" <<<"$output" || { printf '%s\n' "$output"; exit 1; }
   ! grep -q '^digest ' "$log" || { cat "$log"; echo "DISTRIBUTION_EXISTING_SELF_TESTS=FAIL"; exit 1; }
@@ -259,7 +269,7 @@ EOF
     DISTRIBUTION_EXISTING_DIGEST_WRAPPER="$tmp/digest.sh" \
     DISTRIBUTION_EXISTING_GITOPS_CHECK_WRAPPER="$tmp/gitops-check.sh" \
     DISTRIBUTION_EXISTING_ARGO_CHECK_WRAPPER="$tmp/argo-check.sh" \
-    bash "$0" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --no-extra-config-changes
+    bash "$0" --project-dir "$project_repo" --build-url https://ci/job/x/47 --version IFT-0.0.27 --distribution-type ift --no-extra-config-changes
   )"
   rc=$?
   set -e
@@ -340,6 +350,7 @@ done
 
 [[ -n "$VERSION" ]] || emit_error "missing_version" "Missing exact version" "version"
 [[ -n "$DISTRIBUTION_TYPE" ]] || emit_error "missing_distribution_type" "Missing distribution type" "distribution type"
+require_project_dir
 resolve_project_name
 resolve_branch
 apply_defaults

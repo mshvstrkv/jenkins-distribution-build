@@ -74,6 +74,23 @@ emit_common() {
   echo "CHECKED_JOB_NAMES=${CHECKED_JOB_NAMES_CSV:-}"
 }
 
+project_directory_required_exit() {
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "STATE=project_directory_required"
+  echo "REASON=Missing required argument: --project-dir"
+  echo "NEXT_REQUIRED_INPUT=project directory"
+  emit_common
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+require_project_dir() {
+  [[ -n "${PROJECT_DIR:-}" ]] || project_directory_required_exit
+  [[ -d "$PROJECT_DIR" ]] || error_exit "Project directory does not exist: ${PROJECT_DIR}" "project directory"
+  PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+}
+
 error_exit() {
   local reason="$1"
   local next_input="${2:-}"
@@ -113,16 +130,11 @@ jenkins_unreachable_exit() {
 }
 
 resolve_project_name() {
-  if [[ -n "$PROJECT_NAME" ]]; then
-    return 0
-  fi
   local git_root
+  require_project_dir
   git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-  if [[ -n "$git_root" ]]; then
-    PROJECT_NAME="$(basename "$git_root")"
-  else
-    PROJECT_NAME="$(basename "$PROJECT_DIR")"
-  fi
+  [[ -n "$git_root" ]] || error_exit "Project directory is not a Git repository: ${PROJECT_DIR}" "Git repository project directory"
+  PROJECT_NAME="$(basename "$git_root")"
   [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
 }
 
@@ -202,7 +214,7 @@ curl_get_status() {
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 BRANCH=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
 JOB_NAME_ARG=""
@@ -258,6 +270,7 @@ done
 
 JENKINS_URL="${JENKINS_URL:-${JENKINS_URL:-}}"
 [[ -n "$JENKINS_URL" ]] || error_exit "Missing Jenkins URL" "JENKINS_URL"
+require_project_dir
 resolve_project_name
 [[ -n "${JENKINS_USER:-}" ]] || error_exit "Missing required environment variable: JENKINS_USER" "JENKINS_USER"
 [[ -n "${JENKINS_TOKEN:-}" ]] || error_exit "Missing required environment variable: JENKINS_TOKEN" "JENKINS_TOKEN"

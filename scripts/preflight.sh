@@ -484,6 +484,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+require_project_dir
 resolve_project_name
 resolve_branch
 

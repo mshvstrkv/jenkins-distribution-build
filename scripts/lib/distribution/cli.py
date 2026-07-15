@@ -10,6 +10,26 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parents[2]
 
 
+def requires_project_dir(command: str, args: list[str]) -> bool:
+    if "--self-test" in args or "--help" in args or "-h" in args:
+        return False
+    return command in {"build", "deploy", "preflight", "deploy-existing"}
+
+
+def has_project_dir(args: list[str]) -> bool:
+    return "--project-dir" in args
+
+
+def project_dir_required() -> int:
+    print("STATUS=ERROR")
+    print("ACTION=blocked")
+    print("STATE=project_directory_required")
+    print("REASON=Missing required argument: --project-dir")
+    print("NEXT_REQUIRED_INPUT=project directory")
+    print("MUTATIONS_PERFORMED=false")
+    return 1
+
+
 def run_wrapper(name: str, args: list[str]) -> int:
     return subprocess.call([str(SCRIPT_DIR / name), *args])
 
@@ -42,6 +62,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"REASON=Unknown command: {command}")
         print("NEXT_REQUIRED_INPUT=valid command")
         return 1
+    if requires_project_dir(command, argv) and not has_project_dir(argv):
+        return project_dir_required()
     return run_wrapper(wrapper, argv)
 
 

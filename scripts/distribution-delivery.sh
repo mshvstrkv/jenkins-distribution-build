@@ -616,7 +616,7 @@ load_skill_env
 ORIGINAL_ARGS=("$@")
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 BRANCH=""
 JOB_NAME=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
@@ -689,6 +689,7 @@ if [[ "$PREFLIGHT" == "true" ]]; then
 fi
 
 resolve_jenkins_url
+require_project_dir
 resolve_project_name
 resolve_branch
 [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"

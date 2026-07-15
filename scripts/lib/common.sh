@@ -4,7 +4,7 @@ COMMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "${COMMON_LIB_DIR}/.." && pwd)}"
 SKILL_ROOT="${SKILL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 
 warn() {
   echo "WARNING=$*"
@@ -41,6 +41,30 @@ load_skill_env() {
       export "$key=$value"
     fi
   done <"$ENV_FILE"
+}
+
+project_directory_required_exit() {
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "STATE=project_directory_required"
+  echo "REASON=Missing required argument: --project-dir"
+  echo "NEXT_REQUIRED_INPUT=project directory"
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+require_project_dir() {
+  [[ -n "${PROJECT_DIR:-}" ]] || project_directory_required_exit
+  [[ -d "$PROJECT_DIR" ]] || error_exit "Project directory does not exist: ${PROJECT_DIR}" "project directory"
+  PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+}
+
+project_git_root() {
+  require_project_dir
+  local git_root
+  git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
+  [[ -n "$git_root" ]] || error_exit "Project directory is not a Git repository: ${PROJECT_DIR}" "Git repository project directory"
+  printf '%s' "$git_root"
 }
 
 error_exit() {
@@ -92,31 +116,20 @@ resolve_jenkins_url() {
 }
 
 resolve_project_name() {
-  if [[ -n "${PROJECT_NAME:-}" ]]; then
-    return 0
-  fi
   local git_root
-  git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-  if [[ -n "$git_root" ]]; then
-    PROJECT_NAME="$(basename "$git_root")"
-    return 0
-  fi
-  PROJECT_NAME="$(basename "$PROJECT_DIR")"
+  git_root="$(project_git_root)"
+  PROJECT_NAME="$(basename "$git_root")"
   [[ -n "$PROJECT_NAME" && "$PROJECT_NAME" != "/" && "$PROJECT_NAME" != "." ]] || error_exit "Missing project name" "project name"
 }
 
 resolve_branch() {
-  if [[ -n "${BRANCH:-}" ]]; then
-    return 0
-  fi
+  require_project_dir
   BRANCH="$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)"
   [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
 }
 
 resolve_repository_url() {
-  if [[ -n "${REPOSITORY_URL:-}" ]]; then
-    return 0
-  fi
+  require_project_dir
   REPOSITORY_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
   [[ -n "$REPOSITORY_URL" ]] || error_exit "Missing repository URL" "repository URL"
 }

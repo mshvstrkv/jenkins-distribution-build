@@ -116,7 +116,7 @@ load_skill_env
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 JOB_NAME=""
 DISTRIBUTION_TYPE=""
 VERSION=""
@@ -136,6 +136,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 
+require_project_dir
 resolve_project_name
 [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"
 DISTRIBUTION_TYPE="$(PYTHONPATH="$SKILL_ROOT" python3 - "$DISTRIBUTION_TYPE" <<'PY'

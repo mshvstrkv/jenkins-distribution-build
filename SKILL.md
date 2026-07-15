@@ -41,9 +41,9 @@ Do not inspect the repository before loading and applying this skill.
 
 Map user intent directly to the wrapper CLI:
 
-- "собери новую версию" -> `scripts/distribution build`
-- "собери дистрибутив" -> `scripts/distribution build`
-- "собери и поставь на тестовый стенд" -> `scripts/distribution deploy --approve-deployment`
+- "собери новую версию" -> `scripts/distribution build --project-dir "$PWD"`
+- "собери дистрибутив" -> `scripts/distribution build --project-dir "$PWD"`
+- "собери и поставь на тестовый стенд" -> `scripts/distribution deploy --project-dir "$PWD" --approve-deployment`
 - "поставь существующую версию на тест" -> deployment flow without inventing a new build, if the CLI supports that mode; otherwise report the exact wrapper error
 - "собери релиз" -> pass `--distribution-type release`
 - "тестовая версия" or "тестовый стенд" -> pass `--distribution-type ift`
@@ -54,9 +54,9 @@ If the user asks for build plus deploy, do not ask separately whether deployment
 
 After loading this skill, the first executable command must be one of:
 
-- `scripts/distribution build`
-- `scripts/distribution deploy`
-- `scripts/distribution preflight`
+- `scripts/distribution build --project-dir "$PWD"`
+- `scripts/distribution deploy --project-dir "$PWD"`
+- `scripts/distribution preflight --project-dir "$PWD"`
 
 Choose the command based only on the user request.
 
@@ -120,6 +120,10 @@ Wrapper path comes from the skill directory.
 
 Project context comes from `--project-dir`.
 
+Перед первым вызовом `scripts/distribution` агент ОБЯЗАН передать `--project-dir`, равный текущему открытому репозиторию пользователя.
+
+Запуск wrappers без `--project-dir` запрещён.
+
 Never determine project name, branch, or repository URL from the skill directory.
 
 ## Regression Examples
@@ -130,7 +134,7 @@ User:
 "собери новую версию текущего проекта"
 
 Expected first executable action:
-`scripts/distribution build ... --wait`
+`scripts/distribution build --project-dir "$PWD" ... --wait`
 
 Forbidden:
 reading `pom.xml` or running Maven.
@@ -141,7 +145,7 @@ User:
 "собери новую версию и поставь на тестовый стенд"
 
 Expected first executable action:
-`scripts/distribution deploy ... --distribution-type ift --approve-deployment`
+`scripts/distribution deploy --project-dir "$PWD" ... --distribution-type ift --approve-deployment`
 
 Forbidden:
 repository exploration before wrapper execution.
@@ -152,7 +156,7 @@ User:
 "собери релизный дистрибутив"
 
 Expected first executable action:
-`scripts/distribution build ... --distribution-type release --wait`
+`scripts/distribution build --project-dir "$PWD" ... --distribution-type release --wait`
 
 ## Goal
 
@@ -164,11 +168,11 @@ For new work, the preferred entrypoint is:
 
 For a full user request such as "build a test distributive and deploy it to the test stand", execute:
 
-`scripts/distribution deploy`
+`scripts/distribution deploy --project-dir "$PWD"`
 
 For a safe end-to-end validation without external mutations, use:
 
-`scripts/distribution preflight`
+`scripts/distribution preflight --project-dir "$PWD"`
 
 The wrapper scripts are the source of truth for lookup, build, versioning, failure analysis, GitOps configuration, Argo CD operations, and deployment state decisions.
 
@@ -183,10 +187,10 @@ The only preferred entrypoint is:
 Legacy wrapper scripts exist for backward compatibility and implementation compatibility.
 
 Use these commands:
-- read-only validation: `scripts/distribution preflight`
-- full delivery: `scripts/distribution deploy`
-- delivery of an already completed Jenkins build: `scripts/distribution deploy-existing`
-- Jenkins-only build: `scripts/distribution build`
+- read-only validation: `scripts/distribution preflight --project-dir "$PWD"`
+- full delivery: `scripts/distribution deploy --project-dir "$PWD"`
+- delivery of an already completed Jenkins build: `scripts/distribution deploy-existing --project-dir "$PWD"`
+- Jenkins-only build: `scripts/distribution build --project-dir "$PWD"`
 - exact Jenkins build status: `scripts/distribution status`
 - exact Jenkins image digest resolution: `scripts/distribution digest`
 - version resolution: `scripts/distribution version`
@@ -206,7 +210,7 @@ The skill must pass arguments to the CLI and report machine output.
 
 When all required build inputs are present in the user request, execute:
 
-`scripts/distribution build`
+`scripts/distribution build --project-dir "$PWD"`
 
 immediately.
 
@@ -253,7 +257,7 @@ Do not ask:
 
 ## Jenkins Build Policy
 
-`scripts/distribution build` runs the Jenkins-only orchestrated flow.
+`scripts/distribution build --project-dir "$PWD"` runs the Jenkins-only orchestrated flow.
 
 It uses:
 - `scripts/jenkins-lookup.sh`
@@ -297,7 +301,7 @@ If the wrapper returns `STATE=jenkins_template_incompatible` or `STATE=jenkins_c
 
 ## Existing Build Delivery Policy
 
-Use `scripts/distribution deploy-existing` when the user selects an already completed Jenkins build, build URL, build number, or exact existing version to deploy.
+Use `scripts/distribution deploy-existing --project-dir "$PWD"` when the user selects an already completed Jenkins build, build URL, build number, or exact existing version to deploy.
 
 `deploy-existing` is authoritative for this flow:
 
@@ -307,8 +311,8 @@ exact Jenkins build status
 -> Argo CD check/sync
 
 It must not:
-- invoke `scripts/distribution build`
-- invoke `scripts/distribution deploy`
+- invoke `scripts/distribution build --project-dir "$PWD"`
+- invoke `scripts/distribution deploy --project-dir "$PWD"`
 - run `scripts/version-resolver.sh`
 - run `scripts/jenkins-build.sh`
 - trigger a new Jenkins build
@@ -317,7 +321,7 @@ It must not:
 
 Explicit `--version` does not mean "reuse existing build" for normal `build` or `deploy`. To deploy an already built version, use:
 
-`scripts/distribution deploy-existing`
+`scripts/distribution deploy-existing --project-dir "$PWD"`
 
 A finished successful build is not stale merely because a newer version can be calculated.
 
@@ -359,11 +363,11 @@ If the user already said any of the following, do not ask again:
 
 In that case continue immediately with:
 
-`scripts/distribution deploy-existing ... --no-extra-config-changes`
+`scripts/distribution deploy-existing --project-dir "$PWD" ... --no-extra-config-changes`
 
 If the user says no to the scope question, continue immediately with:
 
-`scripts/distribution deploy-existing ... --no-extra-config-changes`
+`scripts/distribution deploy-existing --project-dir "$PWD" ... --no-extra-config-changes`
 
 If the user says yes, pause and ask only for exact additional GitOps configuration changes.
 
@@ -377,19 +381,19 @@ Use the same exact `BUILD_URL`, `VERSION`, and `IMAGE_DIGEST` when resuming.
 
 Resume after `STATUS=PAUSED` must use:
 
-`scripts/distribution deploy-existing ... --resume --build-url <exact-url> --version <exact-version> --digest <exact-digest> --no-extra-config-changes`
+`scripts/distribution deploy-existing --project-dir "$PWD" ... --resume --build-url <exact-url> --version <exact-version> --digest <exact-digest> --no-extra-config-changes`
 
 Resume must not call Jenkins build, version resolver, or a digest resolver for another build.
 
 For additional changes, use only the supported wrapper contract:
 
-`scripts/distribution deploy-existing ... --additional-config-changes-file <approved-patch-file>`
+`scripts/distribution deploy-existing --project-dir "$PWD" ... --additional-config-changes-file <approved-patch-file>`
 
 The agent must not edit GitOps YAML directly.
 
 ## Full Workflow
 
-`scripts/distribution deploy` owns this workflow:
+`scripts/distribution deploy --project-dir "$PWD"` owns this workflow:
 
 Jenkins lookup
 -> version resolution
@@ -462,9 +466,9 @@ Release versions:
 
 ## Execution Policy
 
-For full delivery requests, execute `scripts/distribution deploy`.
+For full delivery requests, execute `scripts/distribution deploy --project-dir "$PWD"`.
 
-For preflight requests, execute `scripts/distribution preflight`.
+For preflight requests, execute `scripts/distribution preflight --project-dir "$PWD"`.
 
 For "build distributive" requests, include `--wait`.
 
@@ -524,7 +528,7 @@ Local validation must not access:
 
 Preflight uses:
 
-`scripts/distribution preflight`
+`scripts/distribution preflight --project-dir "$PWD"`
 
 Preflight checks:
 - Jenkins
@@ -542,7 +546,7 @@ Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, pro
 
 Preflight is read-only and must run through:
 
-`scripts/distribution preflight`
+`scripts/distribution preflight --project-dir "$PWD"`
 
 The preflight wrapper collects independent Jenkins, GitOps, and Argo CD stage results.
 
@@ -561,17 +565,17 @@ Do not interpret, duplicate, or reproduce preflight logic in the agent.
 
 Report the wrapper's full stage summary.
 
-`scripts/preflight.sh` and `scripts/distribution-delivery.sh --preflight` are compatibility paths. The preferred CLI path is `scripts/distribution preflight`.
+`scripts/preflight.sh` and `scripts/distribution-delivery.sh --preflight` are compatibility paths. The preferred CLI path is `scripts/distribution preflight --project-dir "$PWD"`.
 
 ## Delivery Policy
 
 Full build and deployment runs only through:
 
-`scripts/distribution deploy`
+`scripts/distribution deploy --project-dir "$PWD"`
 
 Delivery of an already existing Jenkins build runs only through:
 
-`scripts/distribution deploy-existing`
+`scripts/distribution deploy-existing --project-dir "$PWD"`
 
 `scripts/distribution-delivery.sh` is the legacy delivery wrapper behind the CLI.
 
@@ -657,7 +661,7 @@ Do not request confirmation for read-only checks.
 
 ## Preflight Reporting
 
-Report `scripts/distribution preflight` machine output only.
+Report `scripts/distribution preflight --project-dir "$PWD"` machine output only.
 
 If a stage returns `*_NEXT_REQUIRED_INPUT`, ask only for that exact missing input.
 
