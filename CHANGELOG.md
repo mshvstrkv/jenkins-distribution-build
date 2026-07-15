@@ -26,6 +26,9 @@ The format follows Keep a Changelog, and this skill uses semantic versioning.
 ## 1.0.1 - 2026-07-15
 
 ### Fixed
+- Preserved shared Pipeline Script SCM repository, branch, and scriptPath when rendering Jenkins jobs from templates.
+- Limited application repository rendering to EnvInject `REPO_URL`, BRANCH parameter `remoteURL`, and `SONAR_PROJECT_KEY`.
+- Blocked post-create/read-back jobs whose Pipeline SCM was rewritten to the application repository.
 - Preserved configured user-facing Jenkins `JOB_URL` when read-only API calls redirect to the canonical Jenkins host.
 - Required successful Jenkins trigger responses to include a valid `/queue/item/<id>/` `Location` before reporting `BUILD_TRIGGERED=true`.
 - Classified invalid queue URLs and missing queue `Location` as wrapper errors before polling.

@@ -116,6 +116,14 @@ emit_common() {
   echo "MISSING_REQUIRED_PARAMETERS=${MISSING_REQUIRED_PARAMETERS:-}"
   echo "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=${DISTRIBUTION_TYPE_PARAMETER_SUPPORTED:-false}"
   echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
+  echo "APPLICATION_REPOSITORY_URL=${APPLICATION_REPOSITORY_URL:-}"
+  echo "ENV_REPO_URL=${ENV_REPO_URL:-}"
+  echo "BRANCH_PARAMETER_REPOSITORY_URL=${BRANCH_PARAMETER_REPOSITORY_URL:-}"
+  echo "PIPELINE_REPOSITORY_URL=${PIPELINE_REPOSITORY_URL:-}"
+  echo "EXPECTED_PIPELINE_REPOSITORY_URL=${EXPECTED_PIPELINE_REPOSITORY_URL:-}"
+  echo "ACTUAL_PIPELINE_REPOSITORY_URL=${ACTUAL_PIPELINE_REPOSITORY_URL:-}"
+  echo "PIPELINE_BRANCH_SPEC=${PIPELINE_BRANCH_SPEC:-}"
+  echo "PIPELINE_SCRIPT_PATH=${PIPELINE_SCRIPT_PATH:-}"
   echo "CONFIG_DIFF_PATHS=${CONFIG_DIFF_PATHS:-}"
   echo "REPOSITORY_MISMATCH_PATHS=${REPOSITORY_MISMATCH_PATHS:-}"
   echo "PIPELINE_SCM_BRANCH_SPEC=${PIPELINE_SCM_BRANCH_SPEC:-}"
@@ -768,10 +776,48 @@ def looks_like_repo_url(value):
         )
     )
 
+def properties_content_value(value, key):
+    for line in (value or "").splitlines():
+        current_key, sep, current_value = line.partition("=")
+        if sep and current_key.strip() == key:
+            return current_value.strip()
+    return ""
+
+def branch_parameter_remote_url(root):
+    for container in root.iter():
+        if lname(container) != "parameterDefinitions":
+            continue
+        for param in list(container):
+            param_name = ""
+            for child in list(param):
+                if lname(child) == "name" and child.text:
+                    param_name = child.text.strip()
+                    break
+            if param_name != "BRANCH":
+                continue
+            for child in list(param):
+                if lname(child) == "remoteURL":
+                    value = (child.text or "").strip()
+                    if looks_like_repo_url(value):
+                        return value
+    return ""
+
 try:
     root = ET.parse(sys.argv[1]).getroot()
 except Exception:
     sys.exit(1)
+
+for elem in root.iter():
+    if lname(elem) == "propertiescontent":
+        value = properties_content_value(elem.text or "", "REPO_URL")
+        if looks_like_repo_url(value):
+            print(value)
+            sys.exit(0)
+
+branch_remote_url = branch_parameter_remote_url(root)
+if branch_remote_url:
+    print(branch_remote_url)
+    sys.exit(0)
 
 for elem in root.iter():
     if lname(elem) in {"url", "remote", "repositoryurl", "repository"}:
@@ -846,6 +892,10 @@ parameter_mismatch_exit() {
 
 script_path_mismatch_exit() {
   job_verification_exit "jenkins_created_job_script_path_mismatch" "$1" "review created Jenkins job script path"
+}
+
+pipeline_scm_mismatch_exit() {
+  job_verification_exit "jenkins_pipeline_scm_mismatch" "$1" "review Jenkins pipeline SCM configuration"
 }
 
 job_config_unavailable_exit() {
@@ -1046,7 +1096,7 @@ def properties_content_value(value, key):
             return current_value.strip()
     return ""
 
-def repository_fields(root):
+def application_repository_fields(root):
     fields = []
     seen = set()
 
@@ -1061,15 +1111,10 @@ def repository_fields(root):
 
     for elem, path in iter_with_path(root):
         name = lname(elem)
-        lower = name.lower()
         if name == "propertiesContent":
             repo_url = properties_content_value(elem.text or "", "REPO_URL")
             if repo_url:
                 add(f"{path}/REPO_URL", repo_url)
-        if lower in {"url", "remote", "remoteurl", "repositoryurl", "repository"}:
-            value = (elem.text or "").strip()
-            if looks_like_repo_url(value):
-                add(path, value)
 
     for container, container_path in iter_with_path(root):
         if lname(container) != "parameterDefinitions":
@@ -1088,15 +1133,35 @@ def repository_fields(root):
                     add(path_join(param_path, child), child.text or "")
     return fields
 
+def pipeline_definition(root):
+    for elem in root.iter():
+        if lname(elem) == "definition":
+            return elem
+    return None
+
+def first_repo_url(root):
+    if root is None:
+        return ""
+    for elem in root.iter():
+        if lname(elem).lower() in {"url", "remote", "remoteurl", "repositoryurl", "repository"}:
+            value = (elem.text or "").strip()
+            if looks_like_repo_url(value):
+                return value
+    return ""
+
 def first_script_path(root):
+    if root is None:
+        return ""
     for elem in root.iter():
         if lname(elem) == "scriptPath":
             return (elem.text or "").strip()
     return ""
 
 def first_branch_spec(root):
+    if root is None:
+        return ""
     for elem in root.iter():
-        if lname(elem) != "BranchSpec":
+        if not lname(elem).endswith("BranchSpec"):
             continue
         for child in list(elem):
             if lname(child) == "name":
@@ -1126,15 +1191,25 @@ except Exception as exc:
     print(f"VERIFY_REASON=Created job config.xml could not be parsed: {exc}")
     sys.exit(1)
 
-repo_fields = repository_fields(root)
+repo_fields = application_repository_fields(root)
 actual_repo = repo_fields[0][1] if repo_fields else ""
-actual_script = first_script_path(root)
-pipeline_branch_spec = first_branch_spec(root)
+env_repo = next((value for path, value in repo_fields if path.endswith("/REPO_URL")), "")
+branch_remote_repo = next((value for path, value in repo_fields if path.endswith("/remoteURL")), "")
+pipeline_root = pipeline_definition(root)
+pipeline_repo = first_repo_url(pipeline_root)
+actual_script = first_script_path(pipeline_root)
+pipeline_branch_spec = first_branch_spec(pipeline_root)
 parameter_values = params(root)
 missing = sorted(required - set(parameter_values))
 repo_mismatches = sorted(path for path, value in repo_fields if expected_repo and value != expected_repo)
 
 print(f"ACTUAL_REPOSITORY_URL={actual_repo}")
+print(f"APPLICATION_REPOSITORY_URL={expected_repo}")
+print(f"ENV_REPO_URL={env_repo}")
+print(f"BRANCH_PARAMETER_REPOSITORY_URL={branch_remote_repo}")
+print(f"PIPELINE_REPOSITORY_URL={pipeline_repo}")
+print(f"PIPELINE_BRANCH_SPEC={pipeline_branch_spec}")
+print(f"PIPELINE_SCRIPT_PATH={actual_script}")
 print(f"REPOSITORY_MISMATCH_PATHS={','.join(repo_mismatches)}")
 print(f"SCRIPT_PATH={actual_script}")
 print(f"PIPELINE_SCM_BRANCH_SPEC={pipeline_branch_spec}")
@@ -1164,16 +1239,30 @@ if rendered_config:
         print("VERIFY_STATE=jenkins_created_job_config_mismatch")
         print(f"VERIFY_REASON=Rendered job config.xml could not be parsed: {exc}")
         sys.exit(1)
-    rendered_script = first_script_path(rendered_root)
+    rendered_pipeline_root = pipeline_definition(rendered_root)
+    rendered_pipeline_repo = first_repo_url(rendered_pipeline_root)
+    if rendered_pipeline_repo != pipeline_repo:
+        print("VERIFY_STATE=jenkins_pipeline_scm_mismatch")
+        print("VERIFY_REASON=Created Jenkins job pipeline SCM differs from rendered template")
+        print(f"EXPECTED_PIPELINE_REPOSITORY_URL={rendered_pipeline_repo}")
+        print(f"ACTUAL_PIPELINE_REPOSITORY_URL={pipeline_repo}")
+        sys.exit(1)
+    rendered_script = first_script_path(rendered_pipeline_root)
     if rendered_script != actual_script:
         print("VERIFY_STATE=jenkins_created_job_script_path_mismatch")
         print("VERIFY_REASON=Created Jenkins job scriptPath differs from rendered config")
         print(f"EXPECTED_SCRIPT_PATH={rendered_script}")
         print(f"ACTUAL_SCRIPT_PATH={actual_script}")
         sys.exit(1)
-    rendered_branch_spec = first_branch_spec(rendered_root)
+    rendered_branch_spec = first_branch_spec(rendered_pipeline_root)
     if rendered_branch_spec != pipeline_branch_spec:
         print("WARNING=Pipeline SCM BranchSpec differs from rendered template")
+elif expected_repo and pipeline_repo == expected_repo:
+    print("VERIFY_STATE=jenkins_pipeline_scm_mismatch")
+    print("VERIFY_REASON=Jenkins job pipeline SCM points to the application repository")
+    print("EXPECTED_PIPELINE_REPOSITORY_URL=")
+    print(f"ACTUAL_PIPELINE_REPOSITORY_URL={pipeline_repo}")
+    sys.exit(1)
 
 sys.exit(0)
 PY
@@ -1212,6 +1301,14 @@ apply_parameter_metadata() {
 apply_config_verification_metadata() {
   local verify_output="$1"
   ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  APPLICATION_REPOSITORY_URL="$(sed -n 's/^APPLICATION_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  ENV_REPO_URL="$(sed -n 's/^ENV_REPO_URL=//p' "$verify_output" | tail -n 1)"
+  BRANCH_PARAMETER_REPOSITORY_URL="$(sed -n 's/^BRANCH_PARAMETER_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  PIPELINE_REPOSITORY_URL="$(sed -n 's/^PIPELINE_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  EXPECTED_PIPELINE_REPOSITORY_URL="$(sed -n 's/^EXPECTED_PIPELINE_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  ACTUAL_PIPELINE_REPOSITORY_URL="$(sed -n 's/^ACTUAL_PIPELINE_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  PIPELINE_BRANCH_SPEC="$(sed -n 's/^PIPELINE_BRANCH_SPEC=//p' "$verify_output" | tail -n 1)"
+  PIPELINE_SCRIPT_PATH="$(sed -n 's/^PIPELINE_SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
   REPOSITORY_MISMATCH_PATHS="$(sed -n 's/^REPOSITORY_MISMATCH_PATHS=//p' "$verify_output" | tail -n 1)"
   SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
   PIPELINE_SCM_BRANCH_SPEC="$(sed -n 's/^PIPELINE_SCM_BRANCH_SPEC=//p' "$verify_output" | tail -n 1)"
@@ -1233,6 +1330,7 @@ verify_created_job_config() {
     case "$state" in
       jenkins_created_job_repository_mismatch) repository_mismatch_exit "$reason" ;;
       jenkins_created_job_parameter_mismatch) parameter_mismatch_exit "$reason" ;;
+      jenkins_pipeline_scm_mismatch) pipeline_scm_mismatch_exit "$reason" ;;
       jenkins_created_job_script_path_mismatch) script_path_mismatch_exit "$reason" ;;
       *) config_mismatch_exit "${reason:-Created Jenkins job config verification failed}" ;;
     esac
@@ -1297,6 +1395,7 @@ verify_existing_job_before_build() {
     case "$state" in
       jenkins_created_job_repository_mismatch) repository_mismatch_exit "$reason" ;;
       jenkins_created_job_parameter_mismatch) parameter_mismatch_exit "$reason" ;;
+      jenkins_pipeline_scm_mismatch) pipeline_scm_mismatch_exit "$reason" ;;
       *) config_mismatch_exit "${reason:-Existing Jenkins job config verification failed}" ;;
     esac
   fi
@@ -2439,13 +2538,13 @@ XML
 <project>
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
-  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
   <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
 SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
     <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
-  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm><scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath></definition>
 </project>
 XML
   elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "properties-content-reference" ]]; then
@@ -2453,11 +2552,11 @@ XML
 <project>
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
-  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
   <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
 SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry
 CUSTOM_PROJECT=ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
-    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
 </project>
@@ -2467,9 +2566,10 @@ XML
 <project>
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
-  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
-  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
-    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
@@ -2481,14 +2581,14 @@ XML
 <project>
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
-  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
   <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
 SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
     <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
-  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm><scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath></definition>
 </project>
 XML
   fi
@@ -2499,13 +2599,13 @@ existing_job_xml() {
 <project>
   <displayName>ai-payments-auth</displayName>
   <description>Build ai-payments-auth</description>
-  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-auth.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
   <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-auth.git
 SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
     <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
-  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-auth.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm><scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath></definition>
 </project>
 XML
 }
@@ -2646,7 +2746,10 @@ PY
 import sys
 source, target = sys.argv[1:]
 text = open(source, encoding="utf-8").read()
-text = text.replace("</project>", "<definition><scriptPath>Jenkinsfile.other</scriptPath></definition></project>")
+text = text.replace(
+    "<scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath>",
+    "<scriptPath>Jenkinsfile.other</scriptPath>",
+)
 open(target, "w", encoding="utf-8").write(text)
 PY
   elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-missing-version" ]]; then
@@ -2676,6 +2779,17 @@ import sys
 source, target = sys.argv[1:]
 text = open(source, encoding="utf-8").read()
 text = text.replace("</project>", "<publishers><custom.Plugin><value>custom hidden change</value></custom.Plugin></publishers></project>")
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-pipeline-scm-mismatch" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace(
+    "ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git",
+    "ssh://git@example.org/team/ai-payments-auth.git",
+)
 open(target, "w", encoding="utf-8").write(text)
 PY
   elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" ]]; then
@@ -2748,7 +2862,7 @@ EOF
         [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create before review"; exit 1; }
         [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
         ;;
-      readback-repo-mismatch|readback-script-path-mismatch|readback-missing-version|wrong-created-job-url|wrong-canonical-folder|readback-injected-reference|readback-hidden-difference)
+      readback-repo-mismatch|readback-script-path-mismatch|readback-missing-version|wrong-created-job-url|wrong-canonical-folder|readback-injected-reference|readback-hidden-difference|readback-pipeline-scm-mismatch)
         [[ "$create_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create count ${create_count}"; exit 1; }
         [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
         ;;
@@ -2845,7 +2959,9 @@ EOF
   grep -q "REPO_URL=ssh://git@example.org/team/ai-payments-auth.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL EnvInject REPO_URL missing"; exit 1; }
   grep -q "SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL SONAR_PROJECT_KEY missing"; exit 1; }
   grep -q "<remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL BRANCH remoteURL missing"; exit 1; }
+  grep -q "ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL pipeline repository changed"; exit 1; }
   grep -q "<name>2.0</name>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL BranchSpec changed"; exit 1; }
+  grep -q "<scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL scriptPath changed"; exit 1; }
   grep -q "VERSION=IFT-0.0.1" "$tmp/explicit-job-name/trigger-url" || { echo "FAIL trigger did not contain exact version"; exit 1; }
 
   run_create_case generated-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
@@ -2930,6 +3046,11 @@ EOF
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
 
   run_create_case readback-hidden-difference failure "STATE=jenkins_created_job_config_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-pipeline-scm-mismatch failure "STATE=jenkins_pipeline_scm_mismatch" \
     --job-name ai-payments-auth-build \
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git

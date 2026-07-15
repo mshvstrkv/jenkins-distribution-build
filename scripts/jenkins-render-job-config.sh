@@ -303,6 +303,59 @@ def set_direct_child_text(elem, child_name, value):
         if lname(child) == child_name:
             child.text = value
 
+def properties_content_value(value, key):
+    for line in (value or "").splitlines():
+        current_key, sep, current_value = line.partition("=")
+        if sep and current_key.strip() == key:
+            return current_value.strip()
+    return ""
+
+def branch_parameter_remote_url(params):
+    param = params.get("BRANCH")
+    if param is None:
+        return ""
+    for child in list(param):
+        if lname(child) == "remoteURL":
+            return text(child).strip()
+    return ""
+
+def env_repo_url(root):
+    for elem in root.iter():
+        if lname(elem) == "propertiesContent":
+            value = properties_content_value(elem.text or "", "REPO_URL")
+            if value:
+                return value
+    return ""
+
+def pipeline_definition(root):
+    for elem in root.iter():
+        if lname(elem) == "definition":
+            return elem
+    return None
+
+def first_repo_url(root):
+    for elem in root.iter():
+        if lname(elem).lower() in {"url", "remote", "remoteurl", "repositoryurl", "repository"}:
+            value = text(elem).strip()
+            if looks_like_repo_url(value):
+                return value
+    return ""
+
+def first_branch_spec(root):
+    for elem in root.iter():
+        if not lname(elem).endswith("BranchSpec"):
+            continue
+        for child in list(elem):
+            if lname(child) == "name":
+                return text(child).strip()
+    return ""
+
+def first_script_path(root):
+    for elem in root.iter():
+        if lname(elem) == "scriptPath":
+            return text(elem).strip()
+    return ""
+
 try:
     tree = ET.parse(template_config)
 except Exception as exc:
@@ -321,28 +374,21 @@ if missing:
         supported_params=supported_params,
     )
 
-repo_fields = []
-for elem in root.iter():
-    name = lname(elem).lower()
-    if name in {"url", "remote", "remoteurl", "repositoryurl", "repository"} and looks_like_repo_url(text(elem)):
-        repo_fields.append(elem)
-
-if not repo_fields:
+template_env_repo_url = env_repo_url(root)
+template_branch_remote_url = branch_parameter_remote_url(params)
+if not template_env_repo_url or not template_branch_remote_url:
     fail(
         "jenkins_template_incompatible",
-        "Jenkins template does not contain a supported SCM repository URL field",
+        "Jenkins template does not contain supported application repository fields",
         "compatible Jenkins template",
-        unsupported="SCM repository URL",
+        unsupported="EnvInject REPO_URL or BRANCH remoteURL",
         supported_params=supported_params,
     )
 
-template_repo_url = text(repo_fields[0]).strip()
+template_repo_url = template_env_repo_url
 template_project_slug = slug_from_repo(template_repo_url)
 if not repository_url:
     fail("repository_url_required", "Repository URL is required to render Jenkins job config", "repository URL")
-
-for elem in repo_fields:
-    elem.text = repository_url
 
 env_key_mapping = {
     "REPO_URL": repository_url,
@@ -411,6 +457,13 @@ if reference_paths:
     print("MUTATIONS_PERFORMED=false")
     sys.exit(1)
 
+env_repo_rendered = env_repo_url(root)
+branch_remote_rendered = branch_parameter_remote_url(params)
+pipeline_root = pipeline_definition(root)
+pipeline_repo_url = first_repo_url(pipeline_root) if pipeline_root is not None else ""
+pipeline_branch_spec = first_branch_spec(pipeline_root) if pipeline_root is not None else ""
+pipeline_script_path = first_script_path(pipeline_root) if pipeline_root is not None else ""
+
 if output_file:
     os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
     tree.write(output_file, encoding="utf-8", xml_declaration=True)
@@ -423,6 +476,12 @@ print("ACTION=render-job-config")
 print(f"PROJECT_NAME={project_name}")
 print(f"JOB_NAME={job_name}")
 print(f"REPOSITORY_URL={repository_url}")
+print(f"APPLICATION_REPOSITORY_URL={repository_url}")
+print(f"ENV_REPO_URL={env_repo_rendered}")
+print(f"BRANCH_PARAMETER_REPOSITORY_URL={branch_remote_rendered}")
+print(f"PIPELINE_REPOSITORY_URL={pipeline_repo_url}")
+print(f"PIPELINE_BRANCH_SPEC={pipeline_branch_spec}")
+print(f"PIPELINE_SCRIPT_PATH={pipeline_script_path}")
 print("MISSING_PARAMETERS=")
 emit_parameter_metadata(supported_params, [])
 print("UNSUPPORTED_FIELDS=")
@@ -457,7 +516,7 @@ run_self_tests() {
   <scm class="hudson.plugins.git.GitSCM">
     <userRemoteConfigs>
       <hudson.plugins.git.UserRemoteConfig>
-        <url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url>
+        <url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url>
       </hudson.plugins.git.UserRemoteConfig>
     </userRemoteConfigs>
   </scm>
@@ -491,7 +550,7 @@ STATIC_VALUE=keep</propertiesContent>
     <scm>
       <userRemoteConfigs>
         <hudson.plugins.git.UserRemoteConfig>
-          <url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url>
+          <url>ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git</url>
         </hudson.plugins.git.UserRemoteConfig>
       </userRemoteConfigs>
       <branches>
@@ -500,6 +559,7 @@ STATIC_VALUE=keep</propertiesContent>
         </hudson.plugins.git.BranchSpec>
       </branches>
     </scm>
+    <scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath>
   </definition>
 </project>
 XML
@@ -518,7 +578,15 @@ XML
   grep -q "REPO_URL=ssh://git@example.org/team/ai-payments-auth.git" "$rendered" || { echo "FAIL EnvInject REPO_URL replacement"; exit 1; }
   grep -q "SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth" "$rendered" || { echo "FAIL SONAR_PROJECT_KEY replacement"; exit 1; }
   grep -q "<remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL>" "$rendered" || { echo "FAIL BRANCH remoteURL replacement"; exit 1; }
+  grep -q "ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git" "$rendered" || { echo "FAIL pipeline repository changed"; exit 1; }
   grep -q "<name>2.0</name>" "$rendered" || { echo "FAIL BranchSpec changed"; exit 1; }
+  grep -q "<scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath>" "$rendered" || { echo "FAIL scriptPath changed"; exit 1; }
+  grep -q "APPLICATION_REPOSITORY_URL=ssh://git@example.org/team/ai-payments-auth.git" "$tmp/render.out" || { echo "FAIL application repository output"; exit 1; }
+  grep -q "ENV_REPO_URL=ssh://git@example.org/team/ai-payments-auth.git" "$tmp/render.out" || { echo "FAIL env repo output"; exit 1; }
+  grep -q "BRANCH_PARAMETER_REPOSITORY_URL=ssh://git@example.org/team/ai-payments-auth.git" "$tmp/render.out" || { echo "FAIL branch repo output"; exit 1; }
+  grep -q "PIPELINE_REPOSITORY_URL=ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git" "$tmp/render.out" || { echo "FAIL pipeline repository output"; exit 1; }
+  grep -q "PIPELINE_BRANCH_SPEC=2.0" "$tmp/render.out" || { echo "FAIL pipeline branch output"; exit 1; }
+  grep -q "PIPELINE_SCRIPT_PATH=pipeline/csdo/universal-sbrf-nexus-deploy.groovy" "$tmp/render.out" || { echo "FAIL pipeline script output"; exit 1; }
   grep -q "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=true" "$tmp/render.out" || { echo "FAIL distribution type supported output"; exit 1; }
 
   grep -v '<name>DISTRIBUTION_TYPE</name>' "$template" >"$no_dtype_template"
