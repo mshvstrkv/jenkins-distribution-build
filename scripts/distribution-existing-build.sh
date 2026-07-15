@@ -19,6 +19,7 @@ Usage:
     --version <exact-version> \
     --distribution-type <ift|release> \
     [--branch <branch>] \
+    [--project-dir <path>] \
     [--resume] \
     [--digest <exact-image-digest>] \
     [--no-extra-config-changes] \
@@ -313,6 +314,7 @@ while [[ $# -gt 0 ]]; do
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$(normalize_distribution_type "$2")"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
+    --project-dir) require_value "$1" "${2:-}"; PROJECT_DIR="$2"; shift 2 ;;
     --environment) require_value "$1" "${2:-}"; ENVIRONMENT="$2"; shift 2 ;;
     --config-repo-url) require_value "$1" "${2:-}"; CONFIG_REPO_URL="$2"; shift 2 ;;
     --config-repo-branch) require_value "$1" "${2:-}"; CONFIG_REPO_BRANCH="$2"; shift 2 ;;

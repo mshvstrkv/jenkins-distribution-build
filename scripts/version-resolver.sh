@@ -10,6 +10,7 @@ Usage:
   bash scripts/version-resolver.sh \
     --jenkins-url <url> \
     --project-name <name> \
+    [--project-dir <path>] \
     --job-name <name> \
     --distribution-type <ift|release|test|testing|prod|production> \
     [--version <explicit-version>] \
@@ -115,6 +116,7 @@ load_skill_env
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 JOB_NAME=""
 DISTRIBUTION_TYPE=""
 VERSION=""
@@ -124,6 +126,7 @@ while [[ $# -gt 0 ]]; do
     --self-test) run_self_tests; exit 0 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
+    --project-dir) require_value "$1" "${2:-}"; PROJECT_DIR="$2"; shift 2 ;;
     --job-name) require_value "$1" "${2:-}"; JOB_NAME="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;
     --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;

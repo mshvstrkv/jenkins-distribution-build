@@ -10,6 +10,7 @@ Usage:
   bash scripts/preflight.sh \
     --jenkins-url <url> \
     --project-name <name> \
+    [--project-dir <path>] \
     --branch <branch> \
     --distribution-type <ift|release> \
     [--job-name <name>] \
@@ -197,6 +198,7 @@ run_jenkins_stage() {
     "$SCRIPT_DIR/jenkins-lookup.sh"
       --jenkins-url "$JENKINS_URL"
     --project-name "$PROJECT_NAME"
+    --project-dir "$PROJECT_DIR"
     --branch "$BRANCH"
   )
   [[ -n "$JOB_NAME_ARG" ]] && lookup_args+=(--job-name "$JOB_NAME_ARG")
@@ -253,6 +255,7 @@ run_jenkins_stage() {
     "$SCRIPT_DIR/version-resolver.sh"
       --jenkins-url "$JENKINS_URL"
     --project-name "$PROJECT_NAME"
+    --project-dir "$PROJECT_DIR"
     --job-name "$JOB_NAME"
     --distribution-type "$DISTRIBUTION_TYPE"
   )
@@ -452,6 +455,7 @@ while [[ $# -gt 0 ]]; do
     --self-test) run_self_tests; exit 0 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
+    --project-dir) require_value "$1" "${2:-}"; PROJECT_DIR="$2"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
     --job-name) require_value "$1" "${2:-}"; JOB_NAME_ARG="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;

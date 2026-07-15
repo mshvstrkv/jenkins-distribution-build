@@ -3,7 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${SKILL_ROOT}/.env"
+ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
+source "$SCRIPT_DIR/lib/common.sh"
 
 load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
@@ -46,9 +47,11 @@ Usage:
   bash scripts/distribution-delivery.sh \
     --jenkins-url <url> \
     --project-name <name> \
+    [--project-dir <path>] \
     --branch <branch> \
     [--job-name <job-name>] \
     [--template-job <job-name>] \
+    [--repository-url <url>] \
     --distribution-type <ift|release|test|testing|prod|production> \
     [--version <version>] \
     [--jenkins-branch-param <name>] \
@@ -613,11 +616,13 @@ load_skill_env
 ORIGINAL_ARGS=("$@")
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 BRANCH=""
 JOB_NAME=""
-TEMPLATE_JOB=""
+TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
 DISTRIBUTION_TYPE=""
 VERSION=""
+REPOSITORY_URL=""
 TIMEOUT_SECONDS=1800
 CONFIG_REPO_URL="${CONFIG_REPO_URL:-}"
 CONFIG_REPO_BRANCH="${CONFIG_REPO_BRANCH:-}"
@@ -646,9 +651,11 @@ while [[ $# -gt 0 ]]; do
     --self-test) run_self_tests; exit 0 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
+    --project-dir) require_value "$1" "${2:-}"; PROJECT_DIR="$2"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
     --job-name) require_value "$1" "${2:-}"; JOB_NAME="$2"; shift 2 ;;
     --template-job) require_value "$1" "${2:-}"; TEMPLATE_JOB="$2"; shift 2 ;;
+    --repository-url) require_value "$1" "${2:-}"; REPOSITORY_URL="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;
     --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
     --timeout-seconds) require_value "$1" "${2:-}"; TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -742,31 +749,43 @@ lookup_args=(
   "$SCRIPT_DIR/jenkins-lookup.sh"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
+  --project-dir "$PROJECT_DIR"
   --branch "$BRANCH"
 )
 [[ -n "$JOB_NAME" ]] && lookup_args+=(--job-name "$JOB_NAME")
 [[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
 run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
 JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
+LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
-version_args=(
-  "$SCRIPT_DIR/version-resolver.sh"
-  --jenkins-url "$JENKINS_URL"
-  --project-name "$PROJECT_NAME"
-  --distribution-type "$DISTRIBUTION_TYPE"
-)
-[[ -n "$JOB_NAME" ]] && version_args+=(--job-name "$JOB_NAME")
-[[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
-DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
-VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
+if [[ "$LOOKUP_EXISTS" == "false" && -z "$VERSION" ]]; then
+  case "$DISTRIBUTION_TYPE" in
+    ift) VERSION="IFT-0.0.1" ;;
+    release) VERSION="D-00.000.01" ;;
+    *) error_exit "Unsupported distribution type: ${DISTRIBUTION_TYPE}" "distribution type" ;;
+  esac
+else
+  version_args=(
+    "$SCRIPT_DIR/version-resolver.sh"
+    --jenkins-url "$JENKINS_URL"
+    --project-name "$PROJECT_NAME"
+    --project-dir "$PROJECT_DIR"
+    --distribution-type "$DISTRIBUTION_TYPE"
+  )
+  [[ -n "$JOB_NAME" ]] && version_args+=(--job-name "$JOB_NAME")
+  [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
+  run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
+  DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
+  VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
+fi
 
 BUILD_OUTPUT="$WORK_DIR/jenkins-build.out"
 build_args=(
   "$SCRIPT_DIR/jenkins-build.sh"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
+  --project-dir "$PROJECT_DIR"
   --branch "$BRANCH"
   --distribution-type "$DISTRIBUTION_TYPE"
   --timeout-seconds "$TIMEOUT_SECONDS"
@@ -777,8 +796,12 @@ build_args=(
 )
 [[ -n "$JOB_NAME" ]] && build_args+=(--job-name "$JOB_NAME")
 [[ -n "$JOB_NAME" ]] && build_args+=(--skip-lookup)
-[[ -n "$TEMPLATE_JOB" ]] && build_args+=(--template-job "$TEMPLATE_JOB")
+if [[ "$LOOKUP_EXISTS" == "false" ]]; then
+  [[ -n "$TEMPLATE_JOB" ]] || error_exit "Template job is required to create missing Jenkins job" "template job"
+  build_args+=(--template-job "$TEMPLATE_JOB")
+fi
 [[ -n "$VERSION" ]] && build_args+=(--version "$VERSION")
+[[ -n "$REPOSITORY_URL" ]] && build_args+=(--repository-url "$REPOSITORY_URL")
 [[ "$DRY_RUN" == "true" ]] && build_args+=(--dry-run)
 run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
 

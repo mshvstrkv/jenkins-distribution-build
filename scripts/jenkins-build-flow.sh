@@ -15,7 +15,10 @@ Usage:
   bash scripts/jenkins-build-flow.sh \
     [--jenkins-url <url>] \
     [--project-name <name>] \
+    [--project-dir <path>] \
     [--branch <branch>] \
+    [--template-job <job-name>] \
+    [--repository-url <url>] \
     --distribution-type <ift|release|test|testing|prod|production> \
     [--job-name <exact-job-name>] \
     [--version <explicit-version>] \
@@ -176,8 +179,11 @@ load_skill_env
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 BRANCH=""
 JOB_NAME_ARG=""
+TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
+REPOSITORY_URL=""
 DISTRIBUTION_TYPE=""
 VERSION=""
 JENKINS_BRANCH_PARAM="BRANCH"
@@ -193,8 +199,11 @@ while [[ $# -gt 0 ]]; do
     --self-test) run_flow_self_tests; exit 0 ;;
     --jenkins-url) require_value "$1" "${2:-}"; JENKINS_URL="$2"; shift 2 ;;
     --project-name) require_value "$1" "${2:-}"; PROJECT_NAME="$2"; shift 2 ;;
+    --project-dir) require_value "$1" "${2:-}"; PROJECT_DIR="$2"; shift 2 ;;
     --branch) require_value "$1" "${2:-}"; BRANCH="$2"; shift 2 ;;
     --job-name) require_value "$1" "${2:-}"; JOB_NAME_ARG="$2"; shift 2 ;;
+    --template-job) require_value "$1" "${2:-}"; TEMPLATE_JOB="$2"; shift 2 ;;
+    --repository-url) require_value "$1" "${2:-}"; REPOSITORY_URL="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;
     --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
     --jenkins-branch-param) require_value "$1" "${2:-}"; JENKINS_BRANCH_PARAM="$2"; shift 2 ;;
@@ -223,7 +232,7 @@ WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 if [[ "$DRY_RUN" == "true" ]]; then
-  JOB_NAME="${JOB_NAME_ARG:-$PROJECT_NAME}"
+  JOB_NAME="${JOB_NAME_ARG:-${PROJECT_NAME}-build}"
   JOB_URL="${JENKINS_URL%/}/job/${JOB_NAME}"
   if [[ -n "$VERSION" ]]; then
     VERSION_SOURCE="manual"
@@ -243,33 +252,44 @@ lookup_args=(
   "$LOOKUP_WRAPPER"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
+  --project-dir "$PROJECT_DIR"
   --branch "$BRANCH"
 )
 [[ -n "$JOB_NAME_ARG" ]] && lookup_args+=(--job-name "$JOB_NAME_ARG")
+[[ -n "$TEMPLATE_JOB" ]] && lookup_args+=(--template-job "$TEMPLATE_JOB")
 run_and_capture "$LOOKUP_OUTPUT" bash "${lookup_args[@]}" || exit 1
 JOB_NAME="$(value_from_output JOB_NAME "$LOOKUP_OUTPUT")"
 JOB_URL="$(value_from_output JOB_URL "$LOOKUP_OUTPUT")"
+LOOKUP_EXISTS="$(value_from_output EXISTS "$LOOKUP_OUTPUT")"
 
 VERSION_OUTPUT="$WORK_DIR/version.out"
-version_args=(
-  "$VERSION_WRAPPER"
-  --jenkins-url "$JENKINS_URL"
-  --project-name "$PROJECT_NAME"
-  --job-name "$JOB_NAME"
-  --distribution-type "$DISTRIBUTION_TYPE"
-)
-[[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
-run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
-DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
-PREVIOUS_VERSION="$(value_from_output PREVIOUS_VERSION "$VERSION_OUTPUT")"
-VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
-VERSION_SOURCE="$(value_from_output VERSION_SOURCE "$VERSION_OUTPUT")"
+if [[ "$LOOKUP_EXISTS" == "false" && -z "$VERSION" ]]; then
+  PREVIOUS_VERSION=""
+  VERSION="$(default_version_with_python "$DISTRIBUTION_TYPE")"
+  VERSION_SOURCE="default"
+else
+  version_args=(
+    "$VERSION_WRAPPER"
+    --jenkins-url "$JENKINS_URL"
+    --project-name "$PROJECT_NAME"
+    --project-dir "$PROJECT_DIR"
+    --job-name "$JOB_NAME"
+    --distribution-type "$DISTRIBUTION_TYPE"
+  )
+  [[ -n "$VERSION" ]] && version_args+=(--version "$VERSION")
+  run_and_capture "$VERSION_OUTPUT" bash "${version_args[@]}" || exit 1
+  DISTRIBUTION_TYPE="$(value_from_output DISTRIBUTION_TYPE "$VERSION_OUTPUT")"
+  PREVIOUS_VERSION="$(value_from_output PREVIOUS_VERSION "$VERSION_OUTPUT")"
+  VERSION="$(value_from_output VERSION "$VERSION_OUTPUT")"
+  VERSION_SOURCE="$(value_from_output VERSION_SOURCE "$VERSION_OUTPUT")"
+fi
 
 BUILD_OUTPUT="$WORK_DIR/jenkins-build.out"
 build_args=(
   "$BUILD_WRAPPER"
   --jenkins-url "$JENKINS_URL"
   --project-name "$PROJECT_NAME"
+  --project-dir "$PROJECT_DIR"
   --branch "$BRANCH"
   --job-name "$JOB_NAME"
   --skip-lookup
@@ -281,6 +301,11 @@ build_args=(
   --recovery-window-seconds "$RECOVERY_WINDOW_SECONDS"
   --timeout-seconds "$TIMEOUT_SECONDS"
 )
+if [[ "$LOOKUP_EXISTS" == "false" ]]; then
+  [[ -n "$TEMPLATE_JOB" ]] || flow_error "Template job is required to create missing Jenkins job" "template job"
+  build_args+=(--template-job "$TEMPLATE_JOB")
+  [[ -n "$REPOSITORY_URL" ]] && build_args+=(--repository-url "$REPOSITORY_URL")
+fi
 [[ "$WAIT" == "true" ]] && build_args+=(--wait)
 run_and_capture "$BUILD_OUTPUT" bash "${build_args[@]}" || exit 1
 

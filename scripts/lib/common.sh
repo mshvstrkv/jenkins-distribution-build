@@ -4,6 +4,7 @@ COMMON_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="${SCRIPT_DIR:-$(cd "${COMMON_LIB_DIR}/.." && pwd)}"
 SKILL_ROOT="${SKILL_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
 ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 
 warn() {
   echo "WARNING=$*"
@@ -95,12 +96,12 @@ resolve_project_name() {
     return 0
   fi
   local git_root
-  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$git_root" ]]; then
     PROJECT_NAME="$(basename "$git_root")"
     return 0
   fi
-  PROJECT_NAME="$(basename "$(pwd)")"
+  PROJECT_NAME="$(basename "$PROJECT_DIR")"
   [[ -n "$PROJECT_NAME" && "$PROJECT_NAME" != "/" && "$PROJECT_NAME" != "." ]] || error_exit "Missing project name" "project name"
 }
 
@@ -108,8 +109,16 @@ resolve_branch() {
   if [[ -n "${BRANCH:-}" ]]; then
     return 0
   fi
-  BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  BRANCH="$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)"
   [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
+}
+
+resolve_repository_url() {
+  if [[ -n "${REPOSITORY_URL:-}" ]]; then
+    return 0
+  fi
+  REPOSITORY_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+  [[ -n "$REPOSITORY_URL" ]] || error_exit "Missing repository URL" "repository URL"
 }
 
 normalize_distribution_type() {

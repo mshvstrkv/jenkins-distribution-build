@@ -86,6 +86,42 @@ Resolve it relative to skill `<base_dir>` and execute it from there while preser
 
 Never search the application repository for this wrapper.
 
+If wrapper execution requires changing directory to the skill root, pass the current application repository explicitly as:
+
+`--project-dir <current-application-repository>`
+
+Project name and branch resolution belong to wrappers. The agent must not derive them from the skill directory.
+
+First build command shape:
+
+```bash
+SKILL_DIR="<skill-base-dir>"
+bash "$SKILL_DIR/scripts/distribution" build \
+  --project-dir "$PWD" \
+  --distribution-type ift \
+  --wait
+```
+
+First deploy command shape:
+
+```bash
+SKILL_DIR="<skill-base-dir>"
+bash "$SKILL_DIR/scripts/distribution" deploy \
+  --project-dir "$PWD" \
+  --distribution-type ift \
+  --approve-deployment
+```
+
+Do not run `cd "$SKILL_DIR"` before wrapper execution unless `--project-dir "$PWD"` has already captured the application repository.
+
+`$PWD` must be the application repository.
+
+Wrapper path comes from the skill directory.
+
+Project context comes from `--project-dir`.
+
+Never determine project name, branch, or repository URL from the skill directory.
+
 ## Regression Examples
 
 Example A:
@@ -210,6 +246,7 @@ Do not ask:
 - whether the execution environment is correct
 - for Jenkins URL, if wrappers can load it from skill `.env`
 - for project name, if wrappers can use the current project context
+- for branch, if wrappers can resolve it from the current project context
 - for version
 - for job name
 - for deployment confirmation
@@ -232,6 +269,31 @@ It must not run:
 - Kubernetes operations
 
 `scripts/jenkins-build.sh` is a low-level compatibility wrapper. The skill should not use it directly unless the user explicitly asks for the low-level wrapper.
+
+## First Jenkins Job Policy
+
+Wrappers may use these non-secret defaults from skill `.env` or `.env.example`:
+
+- `JENKINS_URL=https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI`
+- `JENKINS_TEMPLATE_JOB=ai-payments-merchant-registry-build`
+
+The approved default example/template job is:
+
+`ai-payments-merchant-registry-build`
+
+This is an example of job structure only. It is not a source of project-specific repository, branch, project name, or configuration values.
+
+When wrappers create a missing Jenkins job from a template, they must render and verify project-specific config before triggering any build.
+
+The agent must not assume a template job is valid for the current project merely because the Jenkins job name changed.
+
+For first-job creation, wrappers resolve repository URL from:
+
+`--repository-url > git remote origin in --project-dir > wrapper error`
+
+If the wrapper returns `STATE=repository_url_required`, ask only for the repository URL.
+
+If the wrapper returns `STATE=jenkins_template_incompatible` or `STATE=jenkins_created_job_mismatch`, stop and report wrapper output. Do not start a build, do not retry with another job name, and do not modify Jenkins manually.
 
 ## Existing Build Delivery Policy
 
@@ -420,20 +482,20 @@ Execute wrappers directly.
 
 ## Network Policy
 
-This skill is intended for the managed infrastructure where Jenkins, GitOps, and Argo CD are reachable.
+This skill is intended to run where Jenkins, GitOps, and Argo CD are reachable.
 
 The agent must not determine network availability independently.
 
 Do not run custom network checks.
 
-Do not ask the user to classify the execution environment.
+Do not ask the user to classify the network.
 
 If a wrapper reports that Jenkins is unreachable, stop and report wrapper output:
 - `STATE`
 - `REASON`
 - `NEXT_REQUIRED_INPUT`
 
-Do not diagnose VPN, proxy, certificates, hostnames, or trust stores.
+Do not diagnose proxy settings, certificates, hostnames, or trust stores.
 
 Do not retry with insecure options such as `curl -k`.
 
@@ -612,6 +674,8 @@ Do not print `JENKINS_TOKEN` or `ARGOCD_AUTH_TOKEN`.
 Do not print `.env`.
 
 Do not read credential values manually.
+
+Do not open, cat, grep, or read `.env`.
 
 The agent must never inspect `.env` to locate Argo CD settings.
 

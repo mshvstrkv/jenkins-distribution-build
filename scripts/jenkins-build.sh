@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${SKILL_ROOT}/.env"
+ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
 
 load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
@@ -14,11 +14,21 @@ load_skill_env() {
     export SKILL_ENV_WARNING_EMITTED=1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue
     local key="${line%%=*}"
     local value="${line#*=}"
     key="${key#"${key%%[![:space:]]*}"}"
     key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ ${#value} -ge 2 ]]; then
+      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     [[ -n "${!key:-}" ]] || export "$key=$value"
   done <"$ENV_FILE"
@@ -33,9 +43,11 @@ Usage:
   bash scripts/jenkins-build.sh \
     [--jenkins-url <url>] \
     [--project-name <name>] \
+    [--project-dir <path>] \
     [--branch <branch>] \
     [--job-name <job-name>] \
     [--template-job <job-name>] \
+    [--repository-url <url>] \
     [--distribution-type <ift|release>] \
     [--version <version>] \
     [--version-source <auto|manual>] \
@@ -50,10 +62,12 @@ Usage:
 
 Optional arguments:
   --jenkins-url        Jenkins base or folder URL. Defaults to JENKINS_URL from skill .env.
-  --project-name       Project name used to find/create Jenkins job. Defaults to git root/current directory name.
-  --branch             Branch passed to Jenkins as BRANCH. Defaults to current git branch.
+  --project-name       Project name used to find/create Jenkins job. Defaults to git root/current directory name from --project-dir.
+  --project-dir        Application repository directory used to resolve project name, branch, and repository URL.
+  --branch             Branch passed to Jenkins as BRANCH. Defaults to current git branch in --project-dir.
   --job-name           Explicit Jenkins job name checked before generated candidates
-  --template-job       Template job name, required when project job is missing
+  --template-job       Template job name, defaults to JENKINS_TEMPLATE_JOB from skill .env when project job is missing
+  --repository-url     Repository URL for rendering a new job config. Defaults to git remote origin in --project-dir.
   --distribution-type  Distributive type: ift|release, aliases: test/testing/prod/production
   --version            Explicit distributive version
   --version-source     Version source hint: auto or manual
@@ -76,9 +90,27 @@ emit_common() {
   echo "STATE=${STATE:-}"
   echo "JENKINS_URL=${JENKINS_URL:-}"
   echo "PROJECT_NAME=${PROJECT_NAME:-}"
+  echo "PROJECT_DIR=${PROJECT_DIR:-}"
   echo "BRANCH=${BRANCH:-}"
+  echo "REPOSITORY_URL=${REPOSITORY_URL:-}"
+  echo "REQUESTED_JOB_NAME=${REQUESTED_JOB_NAME:-}"
+  echo "CREATED_JOB_NAME=${CREATED_JOB_NAME:-}"
+  echo "JOB_NAME_SOURCE=${JOB_NAME_SOURCE:-}"
   echo "JOB_NAME=${JOB_NAME:-}"
   echo "JOB_URL=${JOB_URL:-}"
+  echo "JOB_CONFIGURATION_VERIFIED=${JOB_CONFIGURATION_VERIFIED:-false}"
+  echo "JOB_IDENTITY_VERIFIED=${JOB_IDENTITY_VERIFIED:-false}"
+  echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
+  echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
+  echo "CONFIG_DIFF_PATHS=${CONFIG_DIFF_PATHS:-}"
+  echo "CREATED_JOB_REQUIRES_REVIEW=${CREATED_JOB_REQUIRES_REVIEW:-false}"
+  echo "EXPECTED_REPOSITORY_URL=${EXPECTED_REPOSITORY_URL:-}"
+  echo "ACTUAL_REPOSITORY_URL=${ACTUAL_REPOSITORY_URL:-}"
+  echo "EXPECTED_JOB_NAME=${EXPECTED_JOB_NAME:-}"
+  echo "ACTUAL_JOB_NAME=${ACTUAL_JOB_NAME:-}"
+  echo "EXPECTED_JOB_URL=${EXPECTED_JOB_URL:-}"
+  echo "ACTUAL_JOB_URL=${ACTUAL_JOB_URL:-}"
+  echo "TEMPLATE_REFERENCE_PATHS=${TEMPLATE_REFERENCE_PATHS:-}"
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
   echo "BUILD_NUMBER=${BUILD_NUMBER:-}"
@@ -149,11 +181,11 @@ resolve_project_name() {
     return 0
   fi
   local git_root
-  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$git_root" ]]; then
     PROJECT_NAME="$(basename "$git_root")"
   else
-    PROJECT_NAME="$(basename "$(pwd)")"
+    PROJECT_NAME="$(basename "$PROJECT_DIR")"
   fi
   [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
 }
@@ -162,8 +194,24 @@ resolve_branch() {
   if [[ -n "$BRANCH" ]]; then
     return 0
   fi
-  BRANCH="$(git branch --show-current 2>/dev/null || true)"
+  BRANCH="$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)"
   [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
+}
+
+resolve_repository_url() {
+  if [[ -n "$REPOSITORY_URL" ]]; then
+    return 0
+  fi
+  REPOSITORY_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+  [[ -n "$REPOSITORY_URL" ]] || {
+    echo "STATUS=ERROR"
+    echo "ACTION=blocked"
+    echo "STATE=repository_url_required"
+    echo "REASON=Repository URL is required to render Jenkins job config"
+    NEXT_REQUIRED_INPUT="repository URL"
+    emit_common
+    exit 1
+  }
 }
 
 normalize_distribution_type() {
@@ -589,6 +637,433 @@ curl_download() {
   fi
 }
 
+xml_first_repository_url() {
+  local xml_file="$1"
+  python3 - "$xml_file" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+def lname(elem):
+    return elem.tag.rsplit("}", 1)[-1].lower()
+
+def looks_like_repo_url(value):
+    return bool(
+        value
+        and (
+            value.startswith(("ssh://", "git@", "http://", "https://"))
+            or ".git" in value
+            or "bitbucket" in value.lower()
+        )
+    )
+
+try:
+    root = ET.parse(sys.argv[1]).getroot()
+except Exception:
+    sys.exit(1)
+
+for elem in root.iter():
+    if lname(elem) in {"url", "remote", "repositoryurl", "repository"}:
+        value = (elem.text or "").strip()
+        if looks_like_repo_url(value):
+            print(value)
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+repo_slug_from_url() {
+  local repo_url="$1"
+  python3 - "$repo_url" <<'PY'
+import sys
+import urllib.parse
+
+value = sys.argv[1]
+parsed = urllib.parse.urlparse(value)
+path = parsed.path if parsed.scheme else value
+path = path.rstrip("/")
+if ":" in path and "/" in path and not parsed.scheme:
+    path = path.split(":", 1)[-1]
+base = path.rsplit("/", 1)[-1]
+if base.endswith(".git"):
+    base = base[:-4]
+print(base)
+PY
+}
+
+job_verification_exit() {
+  local state="$1"
+  local reason="$2"
+  local next_input="${3:-review created Jenkins job configuration}"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "STATE=${state}"
+  echo "REASON=${reason}"
+  JOB_CONFIGURATION_VERIFIED=false
+  CREATED_JOB_REQUIRES_REVIEW=true
+  NEXT_REQUIRED_INPUT="$next_input"
+  emit_common
+  exit 1
+}
+
+created_job_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_mismatch" "$1" "review or remove invalid Jenkins job"
+}
+
+config_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_config_mismatch" "$1" "review created Jenkins job configuration"
+}
+
+identity_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_identity_mismatch" "$1" "review created Jenkins job identity"
+}
+
+repository_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_repository_mismatch" "$1" "review created Jenkins job repository"
+}
+
+parameter_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_parameter_mismatch" "$1" "review created Jenkins job parameters"
+}
+
+script_path_mismatch_exit() {
+  job_verification_exit "jenkins_created_job_script_path_mismatch" "$1" "review created Jenkins job script path"
+}
+
+verify_created_config() {
+  local config_file="$1"
+  local verify_output="$2"
+  set +e
+  python3 - "$config_file" "$REPOSITORY_URL" "$TEMPLATE_PROJECT_SLUG" "$PROJECT_NAME" >"$verify_output" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+config_file, expected_repo, template_slug, project_name = sys.argv[1:]
+required_params = {"BRANCH", "VERSION", "DISTRIBUTION_TYPE"}
+
+def lname(elem):
+    return elem.tag.rsplit("}", 1)[-1]
+
+def looks_like_repo_url(value):
+    return bool(
+        value
+        and (
+            value.startswith(("ssh://", "git@", "http://", "https://"))
+            or ".git" in value
+            or "bitbucket" in value.lower()
+        )
+    )
+
+try:
+    root = ET.parse(config_file).getroot()
+except Exception as exc:
+    print(f"VERIFY_REASON=Created job config.xml could not be parsed: {exc}")
+    sys.exit(1)
+
+repos = []
+for elem in root.iter():
+    if lname(elem).lower() in {"url", "remote", "repositoryurl", "repository"}:
+        value = (elem.text or "").strip()
+        if looks_like_repo_url(value):
+            repos.append(value)
+
+actual_repo = repos[0] if repos else ""
+print(f"ACTUAL_REPOSITORY_URL={actual_repo}")
+if actual_repo != expected_repo:
+    print("VERIFY_REASON=Created job repository URL does not match current project repository")
+    sys.exit(1)
+
+params = set()
+for container in root.iter():
+    if lname(container) != "parameterDefinitions":
+        continue
+    for param in list(container):
+        for child in list(param):
+            if lname(child) == "name" and child.text:
+                params.add(child.text.strip())
+                break
+
+missing = sorted(required_params - params)
+if missing:
+    print(f"MISSING_PARAMETERS={','.join(missing)}")
+    print("VERIFY_REASON=Created job is missing required build parameters")
+    sys.exit(1)
+
+approved_text_fields = {"displayName", "description", "defaultValue"}
+if template_slug and template_slug != project_name:
+    for elem in root.iter():
+        if lname(elem) in approved_text_fields and elem.text and template_slug in elem.text:
+            print("VERIFY_REASON=Template project reference remains in created job config")
+            sys.exit(1)
+
+sys.exit(0)
+PY
+  local code=$?
+  set -e
+  return "$code"
+}
+
+job_url_points_to_name() {
+  local actual_url="$1"
+  local expected_name="$2"
+  python3 - "$actual_url" "$expected_name" <<'PY'
+import sys
+import urllib.parse
+
+actual_url, expected_name = sys.argv[1:]
+parts = actual_url.rstrip("/").split("/job/")
+if not parts:
+    sys.exit(1)
+actual_name = urllib.parse.unquote(parts[-1])
+sys.exit(0 if actual_name == expected_name else 1)
+PY
+}
+
+verify_job_identity_from_api() {
+  EXPECTED_JOB_NAME="$JOB_NAME"
+  EXPECTED_JOB_URL="$(job_url_for "$EXPECTED_JOB_NAME")"
+  ACTUAL_JOB_NAME="$(json_field "name" "$BODY_FILE" || true)"
+  ACTUAL_JOB_URL="$(json_field "url" "$BODY_FILE" || true)"
+  [[ -n "$ACTUAL_JOB_URL" ]] && ACTUAL_JOB_URL="${ACTUAL_JOB_URL%/}"
+  [[ -n "$ACTUAL_JOB_URL" ]] && JOB_URL="$ACTUAL_JOB_URL"
+
+  if [[ "$ACTUAL_JOB_NAME" != "$EXPECTED_JOB_NAME" ]]; then
+    identity_mismatch_exit "Created Jenkins job name does not match requested job name"
+  fi
+
+  if [[ "${ACTUAL_JOB_URL%/}" != "${JENKINS_URL%/}/job/"* ]]; then
+    identity_mismatch_exit "Created Jenkins job URL is not under the configured Jenkins folder URL"
+  fi
+
+  if ! job_url_points_to_name "$ACTUAL_JOB_URL" "$EXPECTED_JOB_NAME"; then
+    identity_mismatch_exit "Created Jenkins job URL does not point to the requested job name"
+  fi
+
+  JOB_IDENTITY_VERIFIED=true
+}
+
+inspect_job_config() {
+  local config_file="$1"
+  local rendered_config="${2:-}"
+  local out_file="$3"
+  python3 - "$config_file" "$rendered_config" "$REPOSITORY_URL" "$BRANCH" >"$out_file" <<'PY'
+import sys
+import xml.etree.ElementTree as ET
+
+config_file, rendered_config, expected_repo, expected_branch = sys.argv[1:]
+required = {"BRANCH", "VERSION", "DISTRIBUTION_TYPE"}
+
+def lname(elem):
+    return elem.tag.rsplit("}", 1)[-1]
+
+def looks_like_repo_url(value):
+    return bool(
+        value
+        and (
+            value.startswith(("ssh://", "git@", "http://", "https://"))
+            or ".git" in value
+            or "bitbucket" in value.lower()
+        )
+    )
+
+def first_repo(root):
+    for elem in root.iter():
+        if lname(elem).lower() in {"url", "remote", "repositoryurl", "repository"}:
+            value = (elem.text or "").strip()
+            if looks_like_repo_url(value):
+                return value
+    return ""
+
+def first_script_path(root):
+    for elem in root.iter():
+        if lname(elem) == "scriptPath":
+            return (elem.text or "").strip()
+    return ""
+
+def params(root):
+    values = {}
+    for container in root.iter():
+        if lname(container) != "parameterDefinitions":
+            continue
+        for param in list(container):
+            name = ""
+            default = ""
+            for child in list(param):
+                if lname(child) == "name" and child.text:
+                    name = child.text.strip()
+                elif lname(child) == "defaultValue" and child.text:
+                    default = child.text.strip()
+            if name:
+                values[name] = default
+    return values
+
+try:
+    root = ET.parse(config_file).getroot()
+except Exception as exc:
+    print(f"VERIFY_REASON=Created job config.xml could not be parsed: {exc}")
+    sys.exit(1)
+
+actual_repo = first_repo(root)
+actual_script = first_script_path(root)
+parameter_values = params(root)
+missing = sorted(required - set(parameter_values))
+
+print(f"ACTUAL_REPOSITORY_URL={actual_repo}")
+print(f"SCRIPT_PATH={actual_script}")
+print(f"REQUIRED_PARAMETERS_OK={'false' if missing else 'true'}")
+print(f"MISSING_PARAMETERS={','.join(missing)}")
+print(f"BRANCH_DEFAULT={parameter_values.get('BRANCH', '')}")
+
+if expected_repo and actual_repo != expected_repo:
+    print("VERIFY_STATE=jenkins_created_job_repository_mismatch")
+    print("VERIFY_REASON=Created Jenkins job repository URL does not match current project repository")
+    sys.exit(1)
+
+if missing:
+    print("VERIFY_STATE=jenkins_created_job_parameter_mismatch")
+    print("VERIFY_REASON=Created Jenkins job is missing required build parameters")
+    sys.exit(1)
+
+if rendered_config:
+    try:
+        rendered_root = ET.parse(rendered_config).getroot()
+    except Exception as exc:
+        print("VERIFY_STATE=jenkins_created_job_config_mismatch")
+        print(f"VERIFY_REASON=Rendered job config.xml could not be parsed: {exc}")
+        sys.exit(1)
+    rendered_script = first_script_path(rendered_root)
+    if rendered_script != actual_script:
+        print("VERIFY_STATE=jenkins_created_job_script_path_mismatch")
+        print("VERIFY_REASON=Created Jenkins job scriptPath differs from rendered config")
+        print(f"EXPECTED_SCRIPT_PATH={rendered_script}")
+        print(f"ACTUAL_SCRIPT_PATH={actual_script}")
+        sys.exit(1)
+
+sys.exit(0)
+PY
+}
+
+verify_config_scan() {
+  local config_file="$1"
+  local scan_output="$2"
+  bash "$SCRIPT_DIR/jenkins-render-job-config.sh" \
+    --scan-config "$config_file" \
+    --template-project-name "$TEMPLATE_PROJECT_SLUG" \
+    --template-repository-url "$TEMPLATE_REPOSITORY_URL" \
+    --project-name "$PROJECT_NAME" \
+    --repository-url "$REPOSITORY_URL" >"$scan_output"
+}
+
+compare_rendered_to_created_config() {
+  local compare_output="$1"
+  bash "$SCRIPT_DIR/jenkins-render-job-config.sh" \
+    --compare-config "$RENDERED_CONFIG_FILE" \
+    --created-config "$READBACK_CONFIG_FILE" >"$compare_output"
+}
+
+verify_created_job_config() {
+  local verify_output="$1"
+  local scan_output="$2"
+  local compare_output="$3"
+
+  if ! inspect_job_config "$READBACK_CONFIG_FILE" "$RENDERED_CONFIG_FILE" "$verify_output"; then
+    ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+    SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
+    REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+    local state reason
+    state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
+    reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
+    case "$state" in
+      jenkins_created_job_repository_mismatch) repository_mismatch_exit "$reason" ;;
+      jenkins_created_job_parameter_mismatch) parameter_mismatch_exit "$reason" ;;
+      jenkins_created_job_script_path_mismatch) script_path_mismatch_exit "$reason" ;;
+      *) config_mismatch_exit "${reason:-Created Jenkins job config verification failed}" ;;
+    esac
+  fi
+  ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
+  REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+
+  if ! verify_config_scan "$READBACK_CONFIG_FILE" "$scan_output"; then
+    TEMPLATE_REFERENCE_PATHS="$(sed -n 's/^TEMPLATE_REFERENCE_PATHS=//p' "$scan_output" | tail -n 1)"
+    config_mismatch_exit "Template contains project-specific references outside approved fields"
+  fi
+
+  if ! compare_rendered_to_created_config "$compare_output"; then
+    CONFIG_DIFF_PATHS="$(sed -n 's/^CONFIG_DIFF_PATHS=//p' "$compare_output" | tail -n 1)"
+    config_mismatch_exit "Created Jenkins job config differs from rendered config"
+  fi
+
+  JOB_CONFIGURATION_VERIFIED=true
+}
+
+verify_existing_job_before_build() {
+  if [[ "$JOB_CONFIGURATION_VERIFIED" == "true" ]]; then
+    return 0
+  fi
+
+  EXPECTED_JOB_NAME="$JOB_NAME"
+  EXPECTED_JOB_URL="$(job_url_for "$EXPECTED_JOB_NAME")"
+
+  local status verify_output
+  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/api/json")"
+  case "$status" in
+    200)
+      verify_job_identity_from_api
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while verifying job ${JOB_NAME}: HTTP ${status}" "valid Jenkins credentials"
+      ;;
+    *)
+      identity_mismatch_exit "Jenkins job identity could not be verified: HTTP ${status}"
+      ;;
+  esac
+
+  if [[ -z "$REPOSITORY_URL" ]]; then
+    REPOSITORY_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
+  fi
+  EXPECTED_REPOSITORY_URL="$REPOSITORY_URL"
+
+  curl_download "$READBACK_CONFIG_FILE" \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/config.xml"
+
+  verify_output="${TMP_DIR}/verify-existing-job.out"
+  if ! inspect_job_config "$READBACK_CONFIG_FILE" "" "$verify_output"; then
+    ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+    SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
+    REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+    local state reason
+    state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
+    reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
+    case "$state" in
+      jenkins_created_job_repository_mismatch) repository_mismatch_exit "$reason" ;;
+      jenkins_created_job_parameter_mismatch) parameter_mismatch_exit "$reason" ;;
+      *) config_mismatch_exit "${reason:-Existing Jenkins job config verification failed}" ;;
+    esac
+  fi
+  ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
+  REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+  JOB_CONFIGURATION_VERIFIED=true
+}
+
+emit_job_ready() {
+  echo "STATUS=READY"
+  echo "ACTION=jenkins-job-verified"
+  echo "PROJECT_NAME=${PROJECT_NAME}"
+  echo "JOB_NAME=${JOB_NAME}"
+  echo "JOB_URL=${JOB_URL}"
+  echo "REPOSITORY_URL=${REPOSITORY_URL:-}"
+  echo "BRANCH=${BRANCH}"
+  echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
+  echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
+  echo "JOB_IDENTITY_VERIFIED=${JOB_IDENTITY_VERIFIED:-false}"
+  echo "JOB_CONFIGURATION_VERIFIED=${JOB_CONFIGURATION_VERIFIED:-false}"
+  echo "BUILD_TRIGGERED=false"
+}
+
 header_location() {
   local headers_file="$1"
   sed -n 's/^[Ll]ocation:[[:space:]]*\(.*\)[[:space:]]*$/\1/p' "$headers_file" | tail -n 1 | tr -d '\r'
@@ -840,19 +1315,45 @@ create_job_from_template() {
     error_exit "Jenkins job not found. Checked: ${CHECKED_JOB_NAMES[*]}. --template-job is required to create a missing job." "template job"
   fi
 
-  JOB_NAME="$PROJECT_NAME"
+  JOB_NAME="${JOB_NAME_ARG:-${PROJECT_NAME}-build}"
+  REQUESTED_JOB_NAME="$JOB_NAME"
+  CREATED_JOB_NAME="$JOB_NAME"
+  if [[ -n "$JOB_NAME_ARG" ]]; then
+    JOB_NAME_SOURCE="explicit"
+  else
+    JOB_NAME_SOURCE="generated"
+  fi
   JOB_URL="$(job_url_for "$JOB_NAME")"
+  EXPECTED_JOB_NAME="$JOB_NAME"
 
   if [[ "$DRY_RUN" == "true" ]]; then
     ACTION="dry-run"
     return 0
   fi
 
-  local template_url create_status create_name_encoded
+  resolve_repository_url
+  EXPECTED_REPOSITORY_URL="$REPOSITORY_URL"
+
+  local template_url create_status create_name_encoded render_output verify_output readback_status api_job_url
   template_url="$(job_url_for "$TEMPLATE_JOB")"
   curl_download "$TEMPLATE_CONFIG_FILE" \
     --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
     "${template_url}/config.xml"
+
+  TEMPLATE_REPOSITORY_URL="$(xml_first_repository_url "$TEMPLATE_CONFIG_FILE" || true)"
+  TEMPLATE_PROJECT_SLUG="$(repo_slug_from_url "$TEMPLATE_REPOSITORY_URL")"
+
+  render_output="${TMP_DIR}/render-job-config.out"
+  if ! bash "$SCRIPT_DIR/jenkins-render-job-config.sh" \
+    --template-config "$TEMPLATE_CONFIG_FILE" \
+    --project-name "$PROJECT_NAME" \
+    --job-name "$JOB_NAME" \
+    --repository-url "$REPOSITORY_URL" \
+    --branch "$BRANCH" \
+    --output "$RENDERED_CONFIG_FILE" >"$render_output"; then
+    cat "$render_output"
+    exit 1
+  fi
 
   ensure_crumb
 
@@ -861,7 +1362,7 @@ create_job_from_template() {
     --request POST \
     --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
     --header "Content-Type: application/xml" \
-    --data-binary "@${TEMPLATE_CONFIG_FILE}"
+    --data-binary "@${RENDERED_CONFIG_FILE}"
   )
   if ((${#CRUMB_HEADER[@]} > 0)); then
     curl_args+=("${CRUMB_HEADER[@]}")
@@ -883,6 +1384,30 @@ create_job_from_template() {
       error_exit "Unexpected Jenkins response while creating job ${JOB_NAME}: HTTP ${create_status}" "Jenkins access"
       ;;
   esac
+
+  readback_status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/api/json")"
+  case "$readback_status" in
+    200)
+      verify_job_identity_from_api
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while verifying created job ${JOB_NAME}: HTTP ${readback_status}" "valid Jenkins credentials"
+      ;;
+    *)
+      created_job_mismatch_exit "Created Jenkins job could not be read back: HTTP ${readback_status}"
+      ;;
+  esac
+
+  curl_download "$READBACK_CONFIG_FILE" \
+    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+    "${JOB_URL}/config.xml"
+
+  verify_output="${TMP_DIR}/verify-created-job.out"
+  scan_output="${TMP_DIR}/scan-created-job.out"
+  compare_output="${TMP_DIR}/compare-created-job.out"
+  verify_created_job_config "$verify_output" "$scan_output" "$compare_output"
 }
 
 recover_existing_build() {
@@ -950,6 +1475,10 @@ trigger_build() {
     QUEUE_URL=""
     return 0
   fi
+
+  [[ "$JOB_CONFIGURATION_VERIFIED" == "true" ]] || error_exit "Jenkins job must be verified before triggering build" "verified Jenkins job"
+  [[ "$JOB_IDENTITY_VERIFIED" == "true" ]] || error_exit "Jenkins job identity must be verified before triggering build" "verified Jenkins job identity"
+  [[ "$REQUIRED_PARAMETERS_OK" == "true" ]] || error_exit "Jenkins job parameters must be verified before triggering build" "verified Jenkins job parameters"
 
   local status encoded_branch encoded_branch_param encoded_version_param encoded_distribution_type_param
   encoded_branch="$(urlencode "$BRANCH")"
@@ -1168,6 +1697,27 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/api/json?tr
   exit 0
 fi
 
+if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/api/json" ]]; then
+  printf '{"name":"test-project-build","url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/"}\n' >"$output"
+  printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/config.xml" ]]; then
+  cat >"$output" <<'XML'
+<project>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/test-project.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+  printf '200'
+  exit 0
+fi
+
 if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
   count_file="${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-count"
   count=0
@@ -1324,6 +1874,7 @@ EOF
         --branch develop \
         --job-name test-project-build \
         --skip-lookup \
+        --repository-url ssh://git@example.org/team/test-project.git \
         --distribution-type ift \
         --version IFT-0.0.1 \
         --wait \
@@ -1384,6 +1935,7 @@ EOF
         --branch develop \
         --job-name test-project-build \
         --skip-lookup \
+        --repository-url ssh://git@example.org/team/test-project.git \
         --distribution-type ift \
         --version IFT-0.0.1 \
         --wait \
@@ -1406,6 +1958,7 @@ EOF
         --branch develop \
         --job-name test-project-build \
         --skip-lookup \
+        --repository-url ssh://git@example.org/team/test-project.git \
         --distribution-type ift \
         --version IFT-0.0.1 \
         --wait \
@@ -1445,6 +1998,406 @@ EOF
   run_restart_case
   rm -rf "$tmp"
   echo "JENKINS_BUILD_WAIT_SELF_TESTS=OK"
+}
+
+run_job_create_self_tests() {
+  local tmp bin mock_curl mock_sleep
+  tmp="$(mktemp -d)"
+  bin="$tmp/bin"
+  mkdir -p "$bin"
+  mock_curl="$bin/curl"
+  mock_sleep="$bin/sleep"
+
+  cat >"$mock_sleep" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+
+  cat >"$mock_curl" <<'EOF'
+#!/usr/bin/env bash
+output=""
+headers=""
+method="GET"
+url=""
+data_file=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --dump-header) headers="$2"; shift 2 ;;
+    --write-out) shift 2 ;;
+    --request) method="$2"; shift 2 ;;
+    --user) shift 2 ;;
+    --header) shift 2 ;;
+    --data-binary) data_file="${2#@}"; shift 2 ;;
+    --silent|--show-error|--fail|--globoff) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+: >"$headers"
+mkdir -p "$(dirname "$output")"
+log="${JENKINS_JOB_CREATE_TEST_DIR}/calls.log"
+
+template_xml() {
+  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "incompatible-template" ]]; then
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "hidden-shell-reference" ]]; then
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <description>Build ai-payments-merchant-registry</description>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+  <builders><hudson.tasks.Shell><command>build ai-payments-merchant-registry</command></hudson.tasks.Shell></builders>
+</project>
+XML
+  else
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <description>Build ai-payments-merchant-registry</description>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+  fi
+}
+
+if [[ "$url" == *"/crumbIssuer/api/json" ]]; then
+  printf 'crumb\n' >>"$log"
+  printf '{}\n' >"$output"
+  printf '404'
+  exit 0
+fi
+
+if [[ "$url" == *"/job/template-job/config.xml" ]]; then
+  printf 'fetch-template\n' >>"$log"
+  template_xml >"$output"
+  printf '200'
+  exit 0
+fi
+
+if [[ "$method" == "POST" && "$url" == *"/createItem?name="* ]]; then
+  printf 'createItem\n' >>"$log"
+  count_file="${JENKINS_JOB_CREATE_TEST_DIR}/create-count"
+  count=0
+  [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+  echo "$((count + 1))" >"$count_file"
+  cp "$data_file" "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml"
+  printf '{}\n' >"$output"
+  printf '201'
+  exit 0
+fi
+
+if [[ "$url" == *"/queue/api/json"* || "$url" == *"/api/json?tree=builds"* ]]; then
+  printf '{"items":[],"builds":[]}\n' >"$output"
+  printf '200'
+  exit 0
+fi
+
+if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
+  printf 'buildWithParameters\n' >>"$log"
+  count_file="${JENKINS_JOB_CREATE_TEST_DIR}/build-count"
+  count=0
+  [[ -f "$count_file" ]] && count="$(cat "$count_file")"
+  echo "$((count + 1))" >"$count_file"
+  printf 'Location: https://example.invalid/queue/item/1/\r\n' >"$headers"
+  printf '{}\n' >"$output"
+  printf '201'
+  exit 0
+fi
+
+if [[ "$url" == *"/api/json" ]]; then
+  case "$url" in
+    *"/job/template-job/api/json"*)
+      printf '{}\n' >"$output"
+      printf '404'
+      exit 0
+      ;;
+    *)
+      if [[ ! -f "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" ]]; then
+        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" ]]; then
+          printf 'readback-api\n' >>"$log"
+          printf '{"name":"ai-payments-auth-build","url":"https://example.invalid/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
+          printf '200'
+          exit 0
+        fi
+        printf '{}\n' >"$output"
+        printf '404'
+        exit 0
+      fi
+      printf 'readback-api\n' >>"$log"
+      name="$(python3 - "$url" <<'PY'
+import sys
+from urllib.parse import unquote
+parts = sys.argv[1].split("/job/")
+print(unquote(parts[-1].split("/api/json", 1)[0]))
+PY
+)"
+      if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-name-mismatch" ]]; then
+        name="wrong-job"
+      fi
+      if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-created-job-url" ]]; then
+        printf '{"name":"%s","url":"https://example.invalid/job/other-folder/job/%s/"}\n' "$name" "$name" >"$output"
+      else
+        printf '{"name":"%s","url":"https://example.invalid/job/folder/job/%s/"}\n' "$name" "$name" >"$output"
+      fi
+      printf '200'
+      exit 0
+      ;;
+  esac
+fi
+
+if [[ "$url" == *"/config.xml" ]]; then
+  printf 'readback-config\n' >>"$log"
+  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-repo-mismatch" ]]; then
+    template_xml >"$output"
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-harmless-metadata" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace("<project>", "<project><actions><hudson.model.CauseAction /></actions>", 1)
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-script-path-mismatch" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace("</project>", "<definition><scriptPath>Jenkinsfile.other</scriptPath></definition></project>")
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-missing-version" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+start = text.find("<hudson.model.StringParameterDefinition><name>VERSION</name>")
+if start != -1:
+    end = text.find("</hudson.model.StringParameterDefinition>", start)
+    if end != -1:
+        end += len("</hudson.model.StringParameterDefinition>")
+        text = text[:start] + text[end:]
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-injected-reference" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace("</project>", "<builders><hudson.tasks.Shell><command>build ai-payments-merchant-registry</command></hudson.tasks.Shell></builders></project>")
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-hidden-difference" ]]; then
+    python3 - "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace("</project>", "<publishers><custom.Plugin><value>custom hidden change</value></custom.Plugin></publishers></project>")
+open(target, "w", encoding="utf-8").write(text)
+PY
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" ]]; then
+    cat >"$output" <<'XML'
+<project>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-auth.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+  else
+    cp "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" "$output"
+  fi
+  printf '200'
+  exit 0
+fi
+
+printf '{}\n' >"$output"
+printf '404'
+EOF
+
+  chmod +x "$mock_curl" "$mock_sleep"
+
+  run_create_case() {
+    local scenario="$1"
+    local expected_status="$2"
+    local expected_pattern="$3"
+    shift 3
+    local case_dir output rc create_count build_count
+    case_dir="$tmp/$scenario"
+    mkdir -p "$case_dir/project"
+    set +e
+    output="$(
+      PATH="$bin:$PATH" \
+      JENKINS_JOB_CREATE_TEST_DIR="$case_dir" \
+      JENKINS_JOB_CREATE_SCENARIO="$scenario" \
+      JENKINS_USER=dummy \
+      JENKINS_TOKEN=dummy \
+      bash "$0" \
+        --jenkins-url "https://example.invalid/job/folder" \
+        --project-name ai-payments-auth \
+        --project-dir "$case_dir/project" \
+        --branch develop-corp \
+        --template-job template-job \
+        --distribution-type ift \
+        --version IFT-0.0.1 \
+        "$@"
+    )"
+    rc=$?
+    set -e
+    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} expected success"
+      exit 1
+    fi
+    if [[ "$expected_status" == "failure" && $rc -eq 0 ]]; then
+      printf '%s\n' "$output"
+      echo "FAIL ${scenario} expected failure"
+      exit 1
+    fi
+    grep -q "$expected_pattern" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} missing ${expected_pattern}"; exit 1; }
+    create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
+    build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
+    case "$scenario" in
+      missing-repository-url|incompatible-template|hidden-shell-reference)
+        [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create before review"; exit 1; }
+        [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
+        ;;
+      readback-repo-mismatch|readback-script-path-mismatch|readback-missing-version|wrong-created-job-url|readback-injected-reference|readback-hidden-difference)
+        [[ "$create_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create count ${create_count}"; exit 1; }
+        [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
+        ;;
+      *)
+        [[ "$create_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create count ${create_count}"; exit 1; }
+        [[ "$build_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build count ${build_count}"; exit 1; }
+        ;;
+    esac
+  }
+
+  run_existing_case() {
+    local scenario="$1"
+    local expected_pattern="$2"
+    local case_dir output rc create_count build_count
+    case_dir="$tmp/$scenario"
+    mkdir -p "$case_dir/project"
+    set +e
+    output="$(
+      PATH="$bin:$PATH" \
+      JENKINS_JOB_CREATE_TEST_DIR="$case_dir" \
+      JENKINS_JOB_CREATE_SCENARIO="$scenario" \
+      JENKINS_USER=dummy \
+      JENKINS_TOKEN=dummy \
+      bash "$0" \
+        --jenkins-url "https://example.invalid/job/folder" \
+        --project-name ai-payments-auth \
+        --project-dir "$case_dir/project" \
+        --branch develop-corp \
+        --job-name ai-payments-auth-build \
+        --skip-lookup \
+        --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+        --distribution-type ift \
+        --version IFT-0.0.1
+    )"
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} expected failure"; exit 1; }
+    grep -q "$expected_pattern" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} missing ${expected_pattern}"; exit 1; }
+    create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
+    build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
+    [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected create"; exit 1; }
+    [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} unexpected build"; exit 1; }
+  }
+
+  run_create_case explicit-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+  ! grep -q "ai-payments-merchant-registry" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL template project remains after render"; exit 1; }
+  grep -q "ssh://git@example.org/team/ai-payments-auth.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL rendered repository missing"; exit 1; }
+
+  run_create_case generated-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-harmless-metadata success "JOB_CONFIGURATION_VERIFIED=true" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case missing-repository-url failure "STATE=repository_url_required" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup
+
+  run_create_case incompatible-template failure "STATE=jenkins_template_incompatible" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case hidden-shell-reference failure "STATE=jenkins_template_requires_review" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-repo-mismatch failure "STATE=jenkins_created_job_repository_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-script-path-mismatch failure "STATE=jenkins_created_job_script_path_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-missing-version failure "STATE=jenkins_created_job_parameter_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case wrong-created-job-url failure "STATE=jenkins_created_job_identity_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-injected-reference failure "TEMPLATE_REFERENCE_PATHS=/project/builders/hudson.tasks.Shell/command" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case readback-hidden-difference failure "STATE=jenkins_created_job_config_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_existing_case existing-incompatible "STATE=jenkins_created_job_parameter_mismatch"
+
+  expected_order=$'fetch-template\ncrumb\ncreateItem\nreadback-api\nreadback-config\nbuildWithParameters'
+  actual_order="$(cat "$tmp/explicit-job-name/calls.log")"
+  [[ "$actual_order" == "$expected_order" ]] || {
+    printf 'Expected order:\n%s\nActual order:\n%s\n' "$expected_order" "$actual_order"
+    echo "FAIL create call order"
+    exit 1
+  }
+
+  rm -rf "$tmp"
+  echo "JENKINS_JOB_CREATE_SELF_TESTS=OK"
 }
 
 wait_for_build() {
@@ -1549,8 +2502,10 @@ wait_for_build() {
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 BRANCH=""
-TEMPLATE_JOB=""
+REPOSITORY_URL=""
+TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
 JOB_NAME_ARG=""
 DISTRIBUTION_TYPE=""
 VERSION=""
@@ -1569,6 +2524,24 @@ RECOVERY_WINDOW_SECONDS=3600
 ACTION=""
 JOB_NAME=""
 JOB_URL=""
+REQUESTED_JOB_NAME=""
+CREATED_JOB_NAME=""
+JOB_NAME_SOURCE=""
+EXPECTED_JOB_NAME=""
+ACTUAL_JOB_NAME=""
+EXPECTED_JOB_URL=""
+ACTUAL_JOB_URL=""
+EXPECTED_REPOSITORY_URL=""
+ACTUAL_REPOSITORY_URL=""
+TEMPLATE_REPOSITORY_URL=""
+TEMPLATE_PROJECT_SLUG=""
+TEMPLATE_REFERENCE_PATHS=""
+CONFIG_DIFF_PATHS=""
+SCRIPT_PATH=""
+JOB_IDENTITY_VERIFIED=false
+REQUIRED_PARAMETERS_OK=false
+JOB_CONFIGURATION_VERIFIED=false
+CREATED_JOB_REQUIRES_REVIEW=false
 QUEUE_URL=""
 BUILD_URL=""
 QUEUE_EXECUTABLE_URL=""
@@ -1601,6 +2574,10 @@ while [[ $# -gt 0 ]]; do
       run_build_wait_self_tests
       exit 0
       ;;
+    --self-test-job-create)
+      run_job_create_self_tests
+      exit 0
+      ;;
     --resolve-version-only)
       RESOLVE_VERSION_ONLY=true
       shift
@@ -1613,6 +2590,11 @@ while [[ $# -gt 0 ]]; do
     --project-name)
       require_value "$1" "${2:-}"
       PROJECT_NAME="$2"
+      shift 2
+      ;;
+    --project-dir)
+      require_value "$1" "${2:-}"
+      PROJECT_DIR="$2"
       shift 2
       ;;
     --branch)
@@ -1628,6 +2610,11 @@ while [[ $# -gt 0 ]]; do
     --template-job)
       require_value "$1" "${2:-}"
       TEMPLATE_JOB="$2"
+      shift 2
+      ;;
+    --repository-url)
+      require_value "$1" "${2:-}"
+      REPOSITORY_URL="$2"
       shift 2
       ;;
     --distribution-type)
@@ -1721,10 +2708,19 @@ BODY_FILE="${TMP_DIR}/body"
 HEADERS_FILE="${TMP_DIR}/headers"
 ERROR_FILE="${TMP_DIR}/curl-error"
 TEMPLATE_CONFIG_FILE="${TMP_DIR}/template-config.xml"
+RENDERED_CONFIG_FILE="${TMP_DIR}/rendered-config.xml"
+READBACK_CONFIG_FILE="${TMP_DIR}/readback-config.xml"
 
 if [[ "$DRY_RUN" == "true" ]]; then
   build_candidate_job_names
-  JOB_NAME="${JOB_NAME_ARG:-$PROJECT_NAME}"
+  JOB_NAME="${JOB_NAME_ARG:-${PROJECT_NAME}-build}"
+  REQUESTED_JOB_NAME="$JOB_NAME"
+  CREATED_JOB_NAME="$JOB_NAME"
+  if [[ -n "$JOB_NAME_ARG" ]]; then
+    JOB_NAME_SOURCE="explicit"
+  else
+    JOB_NAME_SOURCE="generated"
+  fi
   JOB_URL="$(job_url_for "$JOB_NAME")"
   resolve_version
   ACTION="dry-run"
@@ -1732,8 +2728,14 @@ else
   if [[ "$SKIP_LOOKUP" == "true" ]]; then
     JOB_NAME="$JOB_NAME_ARG"
     JOB_URL="$(job_url_for "$JOB_NAME")"
-    ACTION="reused"
     build_candidate_job_names
+    if [[ -n "$TEMPLATE_JOB" ]]; then
+      create_job_from_template
+    else
+      REQUESTED_JOB_NAME="$JOB_NAME"
+      JOB_NAME_SOURCE="explicit"
+      ACTION="reused"
+    fi
   elif ! find_existing_job; then
     if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
       error_exit "Jenkins job not found. Checked: ${CHECKED_JOB_NAMES[*]}." "existing Jenkins job"
@@ -1748,7 +2750,9 @@ else
     emit_common
     exit 0
   fi
+  verify_existing_job_before_build
   if ! recover_existing_build; then
+    emit_job_ready
     trigger_build
   fi
   wait_for_build

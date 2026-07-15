@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${SKILL_ROOT}/.env"
+ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
 
 load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
@@ -14,11 +14,21 @@ load_skill_env() {
     export SKILL_ENV_WARNING_EMITTED=1
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
     [[ -z "$line" || "$line" =~ ^[[:space:]]*# || "$line" != *"="* ]] && continue
     local key="${line%%=*}"
     local value="${line#*=}"
     key="${key#"${key%%[![:space:]]*}"}"
     key="${key%"${key##*[![:space:]]}"}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    if [[ ${#value} -ge 2 ]]; then
+      if [[ "${value:0:1}" == "'" && "${value: -1}" == "'" ]]; then
+        value="${value:1:${#value}-2}"
+      elif [[ "${value:0:1}" == '"' && "${value: -1}" == '"' ]]; then
+        value="${value:1:${#value}-2}"
+      fi
+    fi
     [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
     [[ -n "${!key:-}" ]] || export "$key=$value"
   done <"$ENV_FILE"
@@ -33,13 +43,15 @@ Usage:
   bash scripts/jenkins-lookup.sh \
     [--jenkins-url <url>] \
     [--project-name <name>] \
+    [--project-dir <path>] \
     [--branch <branch>] \
     [--job-name <job-name>] \
     [--template-job <job-name>]
 
 Optional arguments:
   --jenkins-url     Jenkins base or folder URL. Defaults to JENKINS_URL from skill .env.
-  --project-name    Project name used to find Jenkins job. Defaults to git root/current directory name.
+  --project-name    Project name used to find Jenkins job. Defaults to git root/current directory name from --project-dir.
+  --project-dir     Application repository directory used to resolve project name.
   --branch         Optional. Accepted for interface compatibility with jenkins-build.sh. Ignored by lookup.
   --job-name        Explicit Jenkins job name checked before generated candidates
   --template-job    Template job name available for later creation
@@ -52,6 +64,7 @@ EOF
 
 emit_common() {
   echo "PROJECT_NAME=${PROJECT_NAME:-}"
+  echo "PROJECT_DIR=${PROJECT_DIR:-}"
   echo "BRANCH=${BRANCH:-}"
   echo "JOB_NAME=${JOB_NAME:-}"
   echo "JOB_URL=${JOB_URL:-}"
@@ -104,11 +117,11 @@ resolve_project_name() {
     return 0
   fi
   local git_root
-  git_root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
   if [[ -n "$git_root" ]]; then
     PROJECT_NAME="$(basename "$git_root")"
   else
-    PROJECT_NAME="$(basename "$(pwd)")"
+    PROJECT_NAME="$(basename "$PROJECT_DIR")"
   fi
   [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
 }
@@ -189,8 +202,9 @@ curl_get_status() {
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
 BRANCH=""
-TEMPLATE_JOB=""
+TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
 JOB_NAME_ARG=""
 JOB_NAME=""
 JOB_URL=""
@@ -210,6 +224,11 @@ while [[ $# -gt 0 ]]; do
     --project-name)
       require_value "$1" "${2:-}"
       PROJECT_NAME="$2"
+      shift 2
+      ;;
+    --project-dir)
+      require_value "$1" "${2:-}"
+      PROJECT_DIR="$2"
       shift 2
       ;;
     --branch)
@@ -293,7 +312,7 @@ if [[ -z "$TEMPLATE_JOB" ]]; then
   error_exit "Job not found" "template job"
 fi
 
-JOB_NAME="$PROJECT_NAME"
+JOB_NAME="${JOB_NAME_ARG:-${PROJECT_NAME}-build}"
 JOB_URL="$(job_url_for "$JOB_NAME")"
 echo "STATUS=OK"
 echo "ACTION=lookup"
