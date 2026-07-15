@@ -663,13 +663,19 @@ curl_download() {
   fi
 }
 
-download_jenkins_config_xml() {
-  local output_file="$1"
-  local current_url="$2"
+jenkins_get_follow_redirect() {
+  local current_url="$1"
+  local output_file="$2"
+  local require_body="${3:-true}"
+  local update_build_url="${4:-false}"
   local status location next_url redirect_count=0
 
+  CURL_GET_STATUS=""
+  CURL_GET_FINAL_URL=""
+  CURL_GET_TECHNICAL_REASON=""
   while true; do
     status="$(curl_http "$output_file" "$HEADERS_FILE" \
+      --globoff \
       --request GET \
       --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
       "$current_url")"
@@ -677,32 +683,84 @@ download_jenkins_config_xml() {
 
     case "$status" in
       200)
-        if [[ ! -s "$output_file" ]]; then
-          job_config_unavailable_exit "Jenkins job config.xml response is empty" "$status"
+        CURL_GET_STATUS="$status"
+        CURL_GET_FINAL_URL="$current_url"
+        if [[ "$require_body" == "true" && ! -s "$output_file" ]]; then
+          CURL_GET_STATUS="563"
         fi
         return 0
         ;;
       301|302|303|307|308)
         location="$(header_location "$HEADERS_FILE")"
-        [[ -n "$location" ]] || job_config_unavailable_exit "Jenkins job config.xml redirect did not include Location" "$status"
+        if [[ -z "$location" ]]; then
+          CURL_GET_STATUS="562"
+          CURL_GET_FINAL_URL="$current_url"
+          return 0
+        fi
         next_url="$(absolute_url "$current_url" "$location")"
         if ! approved_jenkins_redirect_url "$next_url"; then
-          job_config_unavailable_exit "Jenkins job config.xml redirected to an unapproved host" "$status"
+          CURL_GET_STATUS="561"
+          CURL_GET_FINAL_URL="$next_url"
+          return 0
+        fi
+        if [[ "$update_build_url" == "true" ]]; then
+          BUILD_URL="$(build_url_from_api_url "$next_url")"
+          case "$next_url" in
+            */api/json) ;;
+            *) next_url="${BUILD_URL}/api/json" ;;
+          esac
         fi
         current_url="$next_url"
         redirect_count=$((redirect_count + 1))
         if (( redirect_count > 5 )); then
-          job_config_unavailable_exit "Jenkins job config.xml redirected too many times" "$status"
+          CURL_GET_STATUS="562"
+          CURL_GET_FINAL_URL="$current_url"
+          return 0
         fi
         ;;
-      401|403)
-        error_exit "Jenkins access denied while reading job config.xml: HTTP ${status}" "valid Jenkins credentials"
-        ;;
       *)
-        job_config_unavailable_exit "Failed to read Jenkins job config.xml: HTTP ${status}" "$status"
+        CURL_GET_STATUS="$status"
+        CURL_GET_FINAL_URL="$current_url"
+        if [[ -f "$ERROR_FILE" ]]; then
+          CURL_GET_TECHNICAL_REASON="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g' | sanitize_technical_reason)"
+        fi
+        return 0
         ;;
     esac
   done
+}
+
+curl_get_jenkins_api_follow_redirect() {
+  local current_url="$1"
+  local update_build_url="${2:-false}"
+  jenkins_get_follow_redirect "$current_url" "$BODY_FILE" true "$update_build_url"
+}
+
+download_jenkins_config_xml() {
+  local output_file="$1"
+  local current_url="$2"
+
+  jenkins_get_follow_redirect "$current_url" "$output_file" true false
+  case "$CURL_GET_STATUS" in
+    200)
+      return 0
+      ;;
+    401|403)
+      error_exit "Jenkins access denied while reading job config.xml: HTTP ${CURL_GET_STATUS}" "valid Jenkins credentials"
+      ;;
+    561)
+      jenkins_redirect_failed_exit "Jenkins job config.xml redirected to an unapproved host"
+      ;;
+    562)
+      jenkins_redirect_failed_exit "Jenkins job config.xml redirect failed"
+      ;;
+    563)
+      job_config_unavailable_exit "Jenkins job config.xml response is empty" "$HTTP_STATUS"
+      ;;
+    *)
+      job_config_unavailable_exit "Failed to read Jenkins job config.xml: HTTP ${CURL_GET_STATUS}" "$CURL_GET_STATUS"
+      ;;
+  esac
 }
 
 xml_first_repository_url() {
@@ -786,6 +844,10 @@ config_mismatch_exit() {
 
 identity_mismatch_exit() {
   job_verification_exit "jenkins_created_job_identity_mismatch" "$1" "review created Jenkins job identity"
+}
+
+jenkins_redirect_failed_exit() {
+  job_verification_exit "jenkins_redirect_failed" "$1" "Jenkins redirect access"
 }
 
 repository_mismatch_exit() {
@@ -1217,15 +1279,21 @@ verify_existing_job_before_build() {
   EXPECTED_JOB_URL="$(job_url_for "$EXPECTED_JOB_NAME")"
 
   local status verify_output
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/api/json")"
+  curl_get_jenkins_api_follow_redirect "${JOB_URL}/api/json" false
+  status="$CURL_GET_STATUS"
   case "$status" in
     200)
+      JOB_URL="$(build_url_from_api_url "$CURL_GET_FINAL_URL")"
       verify_job_identity_from_api
       ;;
     401|403)
       error_exit "Jenkins access denied while verifying job ${JOB_NAME}: HTTP ${status}" "valid Jenkins credentials"
+      ;;
+    561|562)
+      jenkins_redirect_failed_exit "Jenkins job identity redirect failed"
+      ;;
+    563)
+      identity_mismatch_exit "Jenkins job API response is empty"
       ;;
     *)
       identity_mismatch_exit "Jenkins job identity could not be verified: HTTP ${status}"
@@ -1371,52 +1439,6 @@ build_wait_timeout_exit() {
   exit 1
 }
 
-curl_get_jenkins_api_follow_redirect() {
-  local current_url="$1"
-  local update_build_url="${2:-false}"
-  local status location next_url redirect_count=0
-  CURL_GET_STATUS=""
-
-  while true; do
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-      --request GET \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "$current_url")"
-
-    case "$status" in
-      301|302|303|307|308)
-        location="$(header_location "$HEADERS_FILE")"
-        if [[ -z "$location" ]]; then
-          CURL_GET_STATUS="562"
-          return 0
-        fi
-        next_url="$(absolute_url "$current_url" "$location")"
-        if ! approved_jenkins_redirect_url "$next_url"; then
-          CURL_GET_STATUS="561"
-          return 0
-        fi
-        if [[ "$update_build_url" == "true" ]]; then
-          BUILD_URL="$(build_url_from_api_url "$next_url")"
-          case "$next_url" in
-            */api/json) ;;
-            *) next_url="${BUILD_URL}/api/json" ;;
-          esac
-        fi
-        current_url="$next_url"
-        redirect_count=$((redirect_count + 1))
-        if (( redirect_count > 5 )); then
-          CURL_GET_STATUS="562"
-          return 0
-        fi
-        ;;
-      *)
-        CURL_GET_STATUS="$status"
-        return 0
-        ;;
-    esac
-  done
-}
-
 verify_build_identity_chain() {
   local queue_build_number
 
@@ -1503,14 +1525,13 @@ find_existing_job() {
 
   for candidate in "${CHECKED_JOB_NAMES[@]}"; do
     candidate_url="$(job_url_for "$candidate")"
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-      "${candidate_url}/api/json")"
+    curl_get_jenkins_api_follow_redirect "${candidate_url}/api/json" false
+    status="$CURL_GET_STATUS"
 
     case "$status" in
 	    200)
 	      JOB_NAME="$candidate"
-	      JOB_URL="$candidate_url"
+	      JOB_URL="$(build_url_from_api_url "$CURL_GET_FINAL_URL")"
 	      JOB_EXISTS=true
 	      JOB_CREATED=false
 	      JOB_MODE="existing"
@@ -1520,7 +1541,11 @@ find_existing_job() {
       404)
         ;;
       401|403)
-        error_exit "Jenkins access denied while checking job ${candidate}: HTTP ${status}" "valid Jenkins credentials"
+	      error_exit "Jenkins access denied while checking job ${candidate}: HTTP ${status}" "valid Jenkins credentials"
+	      ;;
+      561|562)
+        STATE="jenkins_redirect_failed"
+        error_exit "Jenkins redirect failed while checking job ${candidate}" "Jenkins job access"
         ;;
       *)
         error_exit "Unexpected Jenkins response while checking job ${candidate}: HTTP ${status}" "Jenkins access"
@@ -1611,15 +1636,21 @@ create_job_from_template() {
       ;;
   esac
 
-  readback_status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/api/json")"
+  curl_get_jenkins_api_follow_redirect "${JOB_URL}/api/json" false
+  readback_status="$CURL_GET_STATUS"
   case "$readback_status" in
     200)
+      JOB_URL="$(build_url_from_api_url "$CURL_GET_FINAL_URL")"
       verify_job_identity_from_api
       ;;
     401|403)
       error_exit "Jenkins access denied while verifying created job ${JOB_NAME}: HTTP ${readback_status}" "valid Jenkins credentials"
+      ;;
+    561|562)
+      jenkins_redirect_failed_exit "Created Jenkins job read-back redirect failed"
+      ;;
+    563)
+      created_job_mismatch_exit "Created Jenkins job API response is empty"
       ;;
     *)
       created_job_mismatch_exit "Created Jenkins job could not be read back: HTTP ${readback_status}"
@@ -1641,11 +1672,8 @@ recover_existing_build() {
   local root_url status recovery_output queue_url build_url
   root_url="$(jenkins_root_url "$JENKINS_URL")"
 
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-    --globoff \
-    --request GET \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${root_url}/queue/api/json?tree=items[id,url,params,task[name,url],actions[parameters[name,value]],executable[url]]")"
+  curl_get_jenkins_api_follow_redirect "${root_url}/queue/api/json?tree=items[id,url,params,task[name,url],actions[parameters[name,value]],executable[url]]" false
+  status="$CURL_GET_STATUS"
   case "$status" in
     200)
       if recovery_output="$(json_recovery_match queue "$BODY_FILE" "$root_url" 2>/dev/null)"; then
@@ -1666,11 +1694,8 @@ recover_existing_build() {
       ;;
   esac
 
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" \
-    --globoff \
-    --request GET \
-    --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
-    "${JOB_URL}/api/json?tree=builds[number,url,result,building,timestamp,actions[parameters[name,value]]]")"
+  curl_get_jenkins_api_follow_redirect "${JOB_URL}/api/json?tree=builds[number,url,result,building,timestamp,actions[parameters[name,value]]]" false
+  status="$CURL_GET_STATUS"
   case "$status" in
     200)
       if recovery_output="$(json_recovery_match builds "$BODY_FILE" "$root_url" 2>/dev/null)"; then
@@ -2415,13 +2440,31 @@ if [[ "$url" == *"/api/json" ]]; then
       exit 0
       ;;
     *)
-	      if [[ ! -f "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" ]]; then
-	        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-empty-config" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" ]]; then
-	          printf 'readback-api\n' >>"$log"
-	          printf '{"name":"ai-payments-auth-build","url":"https://example.invalid/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
-          printf '200'
-          exit 0
-        fi
+		      if [[ ! -f "${JENKINS_JOB_CREATE_TEST_DIR}/created-config.xml" ]]; then
+		        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-job-redirect" && "$url" == https://example.invalid/* ]]; then
+		          printf 'Location: https://ci.jenkins.sberbank.ru/job/folder/job/ai-payments-auth-build/api/json\r\n' >"$headers"
+		          : >"$output"
+		          printf '302'
+		          exit 0
+		        fi
+		        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-path-redirect" && "$url" == https://example.invalid/* ]]; then
+		          printf 'Location: https://ci.jenkins.sberbank.ru/job/other/job/ai-payments-auth-build/api/json\r\n' >"$headers"
+		          : >"$output"
+		          printf '302'
+		          exit 0
+		        fi
+		        if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-incompatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-empty-config" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-job-redirect" || "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-path-redirect" ]]; then
+		          printf 'readback-api\n' >>"$log"
+		          if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-job-redirect" ]]; then
+		            printf '{"name":"ai-payments-auth-build","url":"https://ci.jenkins.sberbank.ru/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
+		          elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-path-redirect" ]]; then
+		            printf '{"name":"ai-payments-auth-build","url":"https://ci.jenkins.sberbank.ru/job/other/job/ai-payments-auth-build/"}\n' >"$output"
+		          else
+		            printf '{"name":"ai-payments-auth-build","url":"https://example.invalid/job/folder/job/ai-payments-auth-build/"}\n' >"$output"
+		          fi
+	          printf '200'
+	          exit 0
+	        fi
         printf '{}\n' >"$output"
         printf '404'
         exit 0
@@ -2454,8 +2497,8 @@ fi
 
 	if [[ "$url" == *"/config.xml" ]]; then
 	  printf 'readback-config\n' >>"$log"
-	  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" ]]; then
-	    existing_job_xml >"$output"
+		  if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-compatible" || "$JENKINS_JOB_CREATE_SCENARIO" == "existing-job-redirect" ]]; then
+		    existing_job_xml >"$output"
 	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-empty-config" ]]; then
 	    : >"$output"
 	  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "existing-config-redirect" && "$url" == https://example.invalid/* ]]; then
@@ -2620,6 +2663,7 @@ EOF
     )"
     rc=$?
     set -e
+    printf '%s\n' "$output" >"$case_dir/output"
     [[ $rc -ne 0 ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} expected failure"; exit 1; }
     grep -q "$expected_pattern" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} missing ${expected_pattern}"; exit 1; }
     create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
@@ -2763,15 +2807,25 @@ EOF
 
 	  run_existing_case existing-incompatible "STATE=jenkins_created_job_parameter_mismatch"
 
-	  run_existing_success_case existing-compatible "JOB_CONFIGURATION_VERIFIED=true"
-	  grep -q "JOB_CREATED=false" "$tmp/existing-compatible/output" || { echo "FAIL existing job reported created"; exit 1; }
-	  grep -q "JOB_EXISTS=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job existence missing"; exit 1; }
-	  grep -q "VERSION=IFT-0.0.1" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing job trigger exact version"; exit 1; }
-	  ! grep -q "DISTRIBUTION_TYPE" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing unsupported distribution type sent"; exit 1; }
+		  run_existing_success_case existing-compatible "JOB_CONFIGURATION_VERIFIED=true"
+		  grep -q "JOB_CREATED=false" "$tmp/existing-compatible/output" || { echo "FAIL existing job reported created"; exit 1; }
+		  grep -q "JOB_EXISTS=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job existence missing"; exit 1; }
+		  grep -q "BUILD_TRIGGERED=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job trigger not reported"; exit 1; }
+		  grep -q "QUEUE_URL=https://example.invalid/queue/item/1/" "$tmp/existing-compatible/output" || { echo "FAIL existing job queue URL missing"; exit 1; }
+		  grep -q "VERSION=IFT-0.0.1" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing job trigger exact version"; exit 1; }
+		  ! grep -q "DISTRIBUTION_TYPE" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing unsupported distribution type sent"; exit 1; }
 
-	  run_existing_success_case existing-config-redirect "JOB_CONFIGURATION_VERIFIED=true"
+		  run_existing_success_case existing-job-redirect "JOB_IDENTITY_VERIFIED=true"
+		  grep -q "CANONICAL_JOB_URL=https://ci.jenkins.sberbank.ru/job/folder/job/ai-payments-auth-build" "$tmp/existing-job-redirect/output" || { echo "FAIL existing job redirect canonical URL"; exit 1; }
 
-	  run_existing_case existing-empty-config "STATE=jenkins_job_config_unavailable"
+		  run_existing_success_case existing-config-redirect "JOB_CONFIGURATION_VERIFIED=true"
+
+		  run_existing_case wrong-path-redirect "STATE=jenkins_created_job_identity_mismatch"
+
+		  run_existing_case existing-empty-config "STATE=jenkins_job_config_unavailable"
+		  grep -q "BUILD_TRIGGERED=false" "$tmp/existing-empty-config/output" || { echo "FAIL pre-trigger error claimed build"; exit 1; }
+		  grep -q "^QUEUE_URL=$" "$tmp/existing-empty-config/output" || { echo "FAIL pre-trigger error kept queue URL"; exit 1; }
+		  grep -q "^BUILD_URL=$" "$tmp/existing-empty-config/output" || { echo "FAIL pre-trigger error kept build URL"; exit 1; }
 
 	  set +e
 	  output="$(

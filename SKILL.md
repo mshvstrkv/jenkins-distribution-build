@@ -68,10 +68,14 @@ Before the first wrapper invocation, the agent must not:
 - read `pom.xml`
 - read `distributive/pom.xml`
 - read `assembly/*`
+- read `AGENTS.md`
+- read `README.md`
 - glob or read `Jenkinsfile`
 - glob or inspect repository `scripts/*`
 - search for Maven wrapper
 - run Maven, Gradle, or Docker
+- run wrapper `--help`
+- run wrapper `--dry-run`
 - create task files, plan files, or todo lists
 - check whether `scripts/distribution` exists inside the application repository
 - read implementation wrapper files
@@ -495,15 +499,17 @@ Do not explain what you are going to do before wrapper execution.
 
 Execute wrappers directly.
 
-## Network Policy
+Do not run `--help` or `--dry-run` before the real wrapper command.
 
-This skill is intended to run where Jenkins, GitOps, and Argo CD are reachable.
+## Network Handling Policy
+
+This skill is intended to run in the internal environment where Jenkins, GitOps, and Argo CD are reachable.
 
 The agent must not determine network availability independently.
 
 Do not run custom network checks.
 
-Do not ask the user to classify the network.
+Do not ask the user to classify or describe the network.
 
 If a wrapper reports that Jenkins is unreachable, stop and report wrapper output:
 - `STATE`
@@ -516,9 +522,9 @@ Do not retry with insecure options such as `curl -k`.
 
 ## Validation Policy
 
-Local validation is the default.
+Validation is wrapper-driven.
 
-Local validation uses:
+Fixture validation uses:
 
 `scripts/distribution deploy --self-test`
 
@@ -531,7 +537,7 @@ It checks only:
 - deployment-state fixtures
 - parameter mapping fixtures
 
-Local validation must not access:
+Fixture validation must not access:
 - Jenkins
 - Bitbucket
 - Argo CD
@@ -754,6 +760,12 @@ The skill is only an orchestrator launcher and output reporter.
 ## Output Policy
 
 Report wrapper output fields only.
+
+Do not claim a Jenkins build started unless wrapper output contains:
+- `BUILD_TRIGGERED=true`
+- non-empty `QUEUE_URL` or non-empty `BUILD_URL`
+
+If a wrapper returns an error before trigger, report only the wrapper error fields.
 
 For successful delivery, report:
 - project
