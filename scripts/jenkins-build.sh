@@ -101,6 +101,11 @@ emit_common() {
   echo "JOB_CONFIGURATION_VERIFIED=${JOB_CONFIGURATION_VERIFIED:-false}"
   echo "JOB_IDENTITY_VERIFIED=${JOB_IDENTITY_VERIFIED:-false}"
   echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
+  echo "REQUIRED_PARAMETERS=${REQUIRED_PARAMETERS:-}"
+  echo "SUPPORTED_PARAMETERS=${SUPPORTED_PARAMETERS:-}"
+  echo "OPTIONAL_PARAMETERS=${OPTIONAL_PARAMETERS:-}"
+  echo "MISSING_REQUIRED_PARAMETERS=${MISSING_REQUIRED_PARAMETERS:-}"
+  echo "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=${DISTRIBUTION_TYPE_PARAMETER_SUPPORTED:-false}"
   echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
   echo "CONFIG_DIFF_PATHS=${CONFIG_DIFF_PATHS:-}"
   echo "CREATED_JOB_REQUIRES_REVIEW=${CREATED_JOB_REQUIRES_REVIEW:-false}"
@@ -132,6 +137,22 @@ emit_common() {
   echo "JENKINS_PARAMETER_VERSION=${JENKINS_VERSION_PARAM:-}"
   echo "JENKINS_PARAMETER_DISTRIBUTION_TYPE=${JENKINS_DISTRIBUTION_TYPE_PARAM:-}"
   echo "MUTATIONS_PERFORMED=${MUTATIONS_PERFORMED:-false}"
+}
+
+project_directory_required_exit() {
+  STATE="project_directory_required"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Missing required argument: --project-dir"
+  NEXT_REQUIRED_INPUT="project directory"
+  emit_common
+  exit 1
+}
+
+require_project_dir() {
+  [[ -n "${PROJECT_DIR:-}" ]] || project_directory_required_exit
+  [[ -d "$PROJECT_DIR" ]] || error_exit "Project directory does not exist: ${PROJECT_DIR}" "project directory"
+  PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 }
 
 error_exit() {
@@ -177,31 +198,22 @@ warn() {
 }
 
 resolve_project_name() {
-  if [[ -n "$PROJECT_NAME" ]]; then
-    return 0
-  fi
   local git_root
+  require_project_dir
   git_root="$(git -C "$PROJECT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-  if [[ -n "$git_root" ]]; then
-    PROJECT_NAME="$(basename "$git_root")"
-  else
-    PROJECT_NAME="$(basename "$PROJECT_DIR")"
-  fi
+  [[ -n "$git_root" ]] || error_exit "Project directory is not a Git repository: ${PROJECT_DIR}" "Git repository project directory"
+  PROJECT_NAME="$(basename "$git_root")"
   [[ -n "$PROJECT_NAME" ]] || error_exit "Missing project name" "project name"
 }
 
 resolve_branch() {
-  if [[ -n "$BRANCH" ]]; then
-    return 0
-  fi
+  require_project_dir
   BRANCH="$(git -C "$PROJECT_DIR" branch --show-current 2>/dev/null || true)"
   [[ -n "$BRANCH" ]] || error_exit "Missing branch" "branch"
 }
 
 resolve_repository_url() {
-  if [[ -n "$REPOSITORY_URL" ]]; then
-    return 0
-  fi
+  require_project_dir
   REPOSITORY_URL="$(git -C "$PROJECT_DIR" remote get-url origin 2>/dev/null || true)"
   [[ -n "$REPOSITORY_URL" ]] || {
     echo "STATUS=ERROR"
@@ -738,7 +750,11 @@ import sys
 import xml.etree.ElementTree as ET
 
 config_file, expected_repo, template_slug, project_name = sys.argv[1:]
-required_params = {"BRANCH", "VERSION", "DISTRIBUTION_TYPE"}
+required_params = {"BRANCH", "VERSION"}
+optional_params = {"DISTRIBUTION_TYPE"}
+
+def csv(values):
+    return ",".join(sorted(values))
 
 def lname(elem):
     return elem.tag.rsplit("}", 1)[-1]
@@ -783,6 +799,11 @@ for container in root.iter():
                 break
 
 missing = sorted(required_params - params)
+print(f"REQUIRED_PARAMETERS={csv(required_params)}")
+print(f"SUPPORTED_PARAMETERS={csv(params)}")
+print(f"OPTIONAL_PARAMETERS={csv(optional_params)}")
+print(f"MISSING_REQUIRED_PARAMETERS={','.join(missing)}")
+print(f"DISTRIBUTION_TYPE_PARAMETER_SUPPORTED={'true' if 'DISTRIBUTION_TYPE' in params else 'false'}")
 if missing:
     print(f"MISSING_PARAMETERS={','.join(missing)}")
     print("VERIFY_REASON=Created job is missing required build parameters")
@@ -850,7 +871,11 @@ import sys
 import xml.etree.ElementTree as ET
 
 config_file, rendered_config, expected_repo, expected_branch = sys.argv[1:]
-required = {"BRANCH", "VERSION", "DISTRIBUTION_TYPE"}
+required = {"BRANCH", "VERSION"}
+optional = {"DISTRIBUTION_TYPE"}
+
+def csv(values):
+    return ",".join(sorted(values))
 
 def lname(elem):
     return elem.tag.rsplit("}", 1)[-1]
@@ -910,6 +935,11 @@ missing = sorted(required - set(parameter_values))
 print(f"ACTUAL_REPOSITORY_URL={actual_repo}")
 print(f"SCRIPT_PATH={actual_script}")
 print(f"REQUIRED_PARAMETERS_OK={'false' if missing else 'true'}")
+print(f"REQUIRED_PARAMETERS={csv(required)}")
+print(f"SUPPORTED_PARAMETERS={csv(parameter_values)}")
+print(f"OPTIONAL_PARAMETERS={csv(optional)}")
+print(f"MISSING_REQUIRED_PARAMETERS={','.join(missing)}")
+print(f"DISTRIBUTION_TYPE_PARAMETER_SUPPORTED={'true' if 'DISTRIBUTION_TYPE' in parameter_values else 'false'}")
 print(f"MISSING_PARAMETERS={','.join(missing)}")
 print(f"BRANCH_DEFAULT={parameter_values.get('BRANCH', '')}")
 
@@ -960,6 +990,18 @@ compare_rendered_to_created_config() {
     --created-config "$READBACK_CONFIG_FILE" >"$compare_output"
 }
 
+apply_parameter_metadata() {
+  local verify_output="$1"
+  REQUIRED_PARAMETERS="$(sed -n 's/^REQUIRED_PARAMETERS=//p' "$verify_output" | tail -n 1)"
+  SUPPORTED_PARAMETERS="$(sed -n 's/^SUPPORTED_PARAMETERS=//p' "$verify_output" | tail -n 1)"
+  OPTIONAL_PARAMETERS="$(sed -n 's/^OPTIONAL_PARAMETERS=//p' "$verify_output" | tail -n 1)"
+  MISSING_REQUIRED_PARAMETERS="$(sed -n 's/^MISSING_REQUIRED_PARAMETERS=//p' "$verify_output" | tail -n 1)"
+  DISTRIBUTION_TYPE_PARAMETER_SUPPORTED="$(sed -n 's/^DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=//p' "$verify_output" | tail -n 1)"
+  [[ -n "$REQUIRED_PARAMETERS" ]] || REQUIRED_PARAMETERS="BRANCH,VERSION"
+  [[ -n "$OPTIONAL_PARAMETERS" ]] || OPTIONAL_PARAMETERS="DISTRIBUTION_TYPE"
+  [[ -n "$DISTRIBUTION_TYPE_PARAMETER_SUPPORTED" ]] || DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=false
+}
+
 verify_created_job_config() {
   local verify_output="$1"
   local scan_output="$2"
@@ -969,6 +1011,7 @@ verify_created_job_config() {
     ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
     SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
     REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+    apply_parameter_metadata "$verify_output"
     local state reason
     state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
     reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
@@ -982,6 +1025,7 @@ verify_created_job_config() {
   ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
   SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
   REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+  apply_parameter_metadata "$verify_output"
 
   if ! verify_config_scan "$READBACK_CONFIG_FILE" "$scan_output"; then
     TEMPLATE_REFERENCE_PATHS="$(sed -n 's/^TEMPLATE_REFERENCE_PATHS=//p' "$scan_output" | tail -n 1)"
@@ -1034,6 +1078,7 @@ verify_existing_job_before_build() {
     ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
     SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
     REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+    apply_parameter_metadata "$verify_output"
     local state reason
     state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
     reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
@@ -1046,6 +1091,7 @@ verify_existing_job_before_build() {
   ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
   SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
   REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+  apply_parameter_metadata "$verify_output"
   JOB_CONFIGURATION_VERIFIED=true
 }
 
@@ -1059,6 +1105,11 @@ emit_job_ready() {
   echo "BRANCH=${BRANCH}"
   echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
   echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
+  echo "REQUIRED_PARAMETERS=${REQUIRED_PARAMETERS:-}"
+  echo "SUPPORTED_PARAMETERS=${SUPPORTED_PARAMETERS:-}"
+  echo "OPTIONAL_PARAMETERS=${OPTIONAL_PARAMETERS:-}"
+  echo "MISSING_REQUIRED_PARAMETERS=${MISSING_REQUIRED_PARAMETERS:-}"
+  echo "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=${DISTRIBUTION_TYPE_PARAMETER_SUPPORTED:-false}"
   echo "JOB_IDENTITY_VERIFIED=${JOB_IDENTITY_VERIFIED:-false}"
   echo "JOB_CONFIGURATION_VERIFIED=${JOB_CONFIGURATION_VERIFIED:-false}"
   echo "BUILD_TRIGGERED=false"
@@ -1499,7 +1550,7 @@ trigger_build() {
   if [[ -n "$VERSION" ]]; then
     build_url+="&${encoded_version_param}=$(urlencode "$VERSION")"
   fi
-  if [[ -n "$DISTRIBUTION_TYPE" ]]; then
+  if [[ -n "$DISTRIBUTION_TYPE" && "$DISTRIBUTION_TYPE_PARAMETER_SUPPORTED" == "true" ]]; then
     build_url+="&${encoded_distribution_type_param}=$(urlencode "$DISTRIBUTION_TYPE")"
   fi
   curl_args+=("$build_url")
@@ -2050,6 +2101,29 @@ template_xml() {
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
 </project>
 XML
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "missing-branch-template" ]]; then
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "no-distribution-type-template" ]]; then
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <description>Build ai-payments-merchant-registry</description>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
   elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "hidden-shell-reference" ]]; then
     cat <<'XML'
 <project>
@@ -2114,6 +2188,7 @@ fi
 
 if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
   printf 'buildWithParameters\n' >>"$log"
+  printf '%s\n' "$url" >"${JENKINS_JOB_CREATE_TEST_DIR}/trigger-url"
   count_file="${JENKINS_JOB_CREATE_TEST_DIR}/build-count"
   count=0
   [[ -f "$count_file" ]] && count="$(cat "$count_file")"
@@ -2278,7 +2353,7 @@ EOF
     create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
     build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
     case "$scenario" in
-      missing-repository-url|incompatible-template|hidden-shell-reference)
+      missing-repository-url|incompatible-template|missing-branch-template|hidden-shell-reference)
         [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create before review"; exit 1; }
         [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
         ;;
@@ -2337,6 +2412,12 @@ EOF
   run_create_case generated-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
 
+  run_create_case no-distribution-type-template success "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=false" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+  ! grep -q "DISTRIBUTION_TYPE" "$tmp/no-distribution-type-template/trigger-url" || { echo "FAIL unsupported distribution type parameter sent"; exit 1; }
+
   run_create_case readback-harmless-metadata success "JOB_CONFIGURATION_VERIFIED=true" \
     --job-name ai-payments-auth-build \
     --skip-lookup \
@@ -2347,6 +2428,11 @@ EOF
     --skip-lookup
 
   run_create_case incompatible-template failure "STATE=jenkins_template_incompatible" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
+  run_create_case missing-branch-template failure "MISSING_REQUIRED_PARAMETERS=BRANCH" \
     --job-name ai-payments-auth-build \
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
@@ -2502,7 +2588,7 @@ wait_for_build() {
 
 JENKINS_URL="${JENKINS_URL:-}"
 PROJECT_NAME=""
-PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="${PROJECT_DIR:-}"
 BRANCH=""
 REPOSITORY_URL=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
@@ -2540,6 +2626,11 @@ CONFIG_DIFF_PATHS=""
 SCRIPT_PATH=""
 JOB_IDENTITY_VERIFIED=false
 REQUIRED_PARAMETERS_OK=false
+REQUIRED_PARAMETERS=""
+SUPPORTED_PARAMETERS=""
+OPTIONAL_PARAMETERS=""
+MISSING_REQUIRED_PARAMETERS=""
+DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=false
 JOB_CONFIGURATION_VERIFIED=false
 CREATED_JOB_REQUIRES_REVIEW=false
 QUEUE_URL=""

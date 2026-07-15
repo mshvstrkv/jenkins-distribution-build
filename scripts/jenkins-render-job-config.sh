@@ -205,15 +205,29 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 
 template_config, project_name, job_name, repository_url, branch, output_file = sys.argv[1:]
-required_params = {"BRANCH", "VERSION", "DISTRIBUTION_TYPE"}
+required_params = {"BRANCH", "VERSION"}
+optional_params = {"DISTRIBUTION_TYPE"}
 
-def fail(state, reason, next_input="", missing="", unsupported=""):
+def csv(values):
+    return ",".join(sorted(values))
+
+def emit_parameter_metadata(supported_params=None, missing_required=None):
+    supported_params = set(supported_params or [])
+    missing_required = sorted(missing_required or [])
+    print(f"REQUIRED_PARAMETERS={csv(required_params)}")
+    print(f"SUPPORTED_PARAMETERS={csv(supported_params)}")
+    print(f"OPTIONAL_PARAMETERS={csv(optional_params)}")
+    print(f"MISSING_REQUIRED_PARAMETERS={','.join(missing_required)}")
+    print(f"DISTRIBUTION_TYPE_PARAMETER_SUPPORTED={'true' if 'DISTRIBUTION_TYPE' in supported_params else 'false'}")
+
+def fail(state, reason, next_input="", missing="", unsupported="", supported_params=None):
     print("STATUS=ERROR")
     print("ACTION=render-job-config")
     print(f"STATE={state}")
     print(f"REASON={reason}")
     if missing:
         print(f"MISSING_PARAMETERS={missing}")
+    emit_parameter_metadata(supported_params, missing.split(",") if missing else [])
     if unsupported:
         print(f"UNSUPPORTED_FIELDS={unsupported}")
     print("TEMPLATE_REFERENCE_COUNT=0")
@@ -276,13 +290,15 @@ except Exception as exc:
 
 root = tree.getroot()
 params = dict(parameter_definitions(root))
-missing = sorted(required_params - set(params))
+supported_params = set(params)
+missing = sorted(required_params - supported_params)
 if missing:
     fail(
         "jenkins_template_incompatible",
         "Jenkins template is missing required build parameters",
         "compatible Jenkins template",
         ",".join(missing),
+        supported_params=supported_params,
     )
 
 repo_fields = []
@@ -297,6 +313,7 @@ if not repo_fields:
         "Jenkins template does not contain a supported SCM repository URL field",
         "compatible Jenkins template",
         unsupported="SCM repository URL",
+        supported_params=supported_params,
     )
 
 template_repo_url = text(repo_fields[0]).strip()
@@ -361,6 +378,7 @@ if reference_paths:
     print("ACTION=render-job-config")
     print("STATE=jenkins_template_requires_review")
     print("REASON=Template contains project-specific references outside approved fields")
+    emit_parameter_metadata(supported_params, [])
     print(f"TEMPLATE_REFERENCE_COUNT={len(safe_paths)}")
     print(f"TEMPLATE_REFERENCE_PATHS={','.join(safe_paths)}")
     print("NEXT_REQUIRED_INPUT=review Jenkins template project-specific fields")
@@ -380,6 +398,7 @@ print(f"PROJECT_NAME={project_name}")
 print(f"JOB_NAME={job_name}")
 print(f"REPOSITORY_URL={repository_url}")
 print("MISSING_PARAMETERS=")
+emit_parameter_metadata(supported_params, [])
 print("UNSUPPORTED_FIELDS=")
 print("TEMPLATE_REFERENCE_COUNT=0")
 print("TEMPLATE_REFERENCE_PATHS=")
@@ -389,12 +408,15 @@ PY
 }
 
 run_self_tests() {
-  local tmp template rendered output rc bad_template hidden_shell downstream notification created_metadata created_hidden
+  local tmp template rendered output rc bad_template missing_branch_template no_dtype_template no_dtype_rendered hidden_shell downstream notification created_metadata created_hidden
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   template="$tmp/template.xml"
   rendered="$tmp/rendered.xml"
   bad_template="$tmp/bad-template.xml"
+  missing_branch_template="$tmp/missing-branch-template.xml"
+  no_dtype_template="$tmp/no-distribution-type-template.xml"
+  no_dtype_rendered="$tmp/no-distribution-type-rendered.xml"
   hidden_shell="$tmp/hidden-shell.xml"
   downstream="$tmp/downstream.xml"
   notification="$tmp/notification.xml"
@@ -444,6 +466,18 @@ XML
   grep -q "ssh://git@example.org/team/ai-payments-auth.git" "$rendered" || { echo "FAIL repository replacement"; exit 1; }
   ! grep -q "ai-payments-merchant-registry" "$rendered" || { echo "FAIL template project reference remains"; exit 1; }
   grep -q "<defaultValue>feature/test</defaultValue>" "$rendered" || { echo "FAIL branch default replacement"; exit 1; }
+  grep -q "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=true" "$tmp/render.out" || { echo "FAIL distribution type supported output"; exit 1; }
+
+  grep -v '<name>DISTRIBUTION_TYPE</name>' "$template" >"$no_dtype_template"
+  bash "$0" \
+    --template-config "$no_dtype_template" \
+    --project-name ai-payments-auth \
+    --job-name ai-payments-auth-build \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+    --branch feature/test \
+    --output "$no_dtype_rendered" >"$tmp/no-dtype-render.out"
+  grep -q "STATUS=OK" "$tmp/no-dtype-render.out" || { echo "FAIL no distribution type accepted"; exit 1; }
+  grep -q "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=false" "$tmp/no-dtype-render.out" || { echo "FAIL no distribution type support output"; exit 1; }
 
   python3 - "$rendered" "$created_metadata" <<'PY'
 import sys
@@ -542,7 +576,21 @@ PY
   set -e
   [[ $rc -ne 0 ]] || { echo "FAIL incompatible template accepted"; exit 1; }
   grep -q "STATE=jenkins_template_incompatible" <<<"$output" || { echo "FAIL incompatible template state"; exit 1; }
-  grep -q "MISSING_PARAMETERS=VERSION" <<<"$output" || { echo "FAIL missing version parameter"; exit 1; }
+  grep -q "MISSING_REQUIRED_PARAMETERS=VERSION" <<<"$output" || { echo "FAIL missing version parameter"; exit 1; }
+
+  grep -v '<name>BRANCH</name>' "$template" >"$missing_branch_template"
+  set +e
+  output="$(bash "$0" \
+    --template-config "$missing_branch_template" \
+    --project-name ai-payments-auth \
+    --job-name ai-payments-auth-build \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+    --branch feature/test 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL missing branch template accepted"; exit 1; }
+  grep -q "STATE=jenkins_template_incompatible" <<<"$output" || { echo "FAIL missing branch template state"; exit 1; }
+  grep -q "MISSING_REQUIRED_PARAMETERS=BRANCH" <<<"$output" || { echo "FAIL missing branch parameter"; exit 1; }
 
   set +e
   output="$(bash "$0" \
