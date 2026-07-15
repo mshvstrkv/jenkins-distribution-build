@@ -93,11 +93,13 @@ emit_common() {
   echo "PROJECT_DIR=${PROJECT_DIR:-}"
   echo "BRANCH=${BRANCH:-}"
   echo "REPOSITORY_URL=${REPOSITORY_URL:-}"
+  echo "JOB_CREATED=${JOB_CREATED:-false}"
   echo "REQUESTED_JOB_NAME=${REQUESTED_JOB_NAME:-}"
   echo "CREATED_JOB_NAME=${CREATED_JOB_NAME:-}"
   echo "JOB_NAME_SOURCE=${JOB_NAME_SOURCE:-}"
   echo "JOB_NAME=${JOB_NAME:-}"
   echo "JOB_URL=${JOB_URL:-}"
+  echo "CANONICAL_JOB_URL=${CANONICAL_JOB_URL:-}"
   echo "JOB_CONFIGURATION_VERIFIED=${JOB_CONFIGURATION_VERIFIED:-false}"
   echo "JOB_IDENTITY_VERIFIED=${JOB_IDENTITY_VERIFIED:-false}"
   echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
@@ -108,6 +110,9 @@ emit_common() {
   echo "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=${DISTRIBUTION_TYPE_PARAMETER_SUPPORTED:-false}"
   echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
   echo "CONFIG_DIFF_PATHS=${CONFIG_DIFF_PATHS:-}"
+  echo "REPOSITORY_MISMATCH_PATHS=${REPOSITORY_MISMATCH_PATHS:-}"
+  echo "PIPELINE_SCM_BRANCH_SPEC=${PIPELINE_SCM_BRANCH_SPEC:-}"
+  echo "WARNING=${WARNING:-}"
   echo "CREATED_JOB_REQUIRES_REVIEW=${CREATED_JOB_REQUIRES_REVIEW:-false}"
   echo "EXPECTED_REPOSITORY_URL=${EXPECTED_REPOSITORY_URL:-}"
   echo "ACTUAL_REPOSITORY_URL=${ACTUAL_REPOSITORY_URL:-}"
@@ -712,6 +717,9 @@ job_verification_exit() {
   echo "REASON=${reason}"
   JOB_CONFIGURATION_VERIFIED=false
   CREATED_JOB_REQUIRES_REVIEW=true
+  if [[ "${JOB_CREATED:-false}" == "true" ]]; then
+    MUTATIONS_PERFORMED=true
+  fi
   NEXT_REQUIRED_INPUT="$next_input"
   emit_common
   exit 1
@@ -758,6 +766,15 @@ def csv(values):
 
 def lname(elem):
     return elem.tag.rsplit("}", 1)[-1]
+
+def path_join(parent, elem):
+    return f"{parent}/{lname(elem)}"
+
+def iter_with_path(elem, path=""):
+    current = path_join(path, elem)
+    yield elem, current
+    for child in list(elem):
+        yield from iter_with_path(child, current)
 
 def looks_like_repo_url(value):
     return bool(
@@ -823,19 +840,31 @@ PY
   return "$code"
 }
 
-job_url_points_to_name() {
-  local actual_url="$1"
-  local expected_name="$2"
-  python3 - "$actual_url" "$expected_name" <<'PY'
+verify_job_url_identity() {
+  local expected_folder_url="$1"
+  local actual_url="$2"
+  local expected_name="$3"
+  python3 - "$expected_folder_url" "$actual_url" "$expected_name" <<'PY'
 import sys
 import urllib.parse
 
-actual_url, expected_name = sys.argv[1:]
-parts = actual_url.rstrip("/").split("/job/")
-if not parts:
+expected_folder_url, actual_url, expected_name = sys.argv[1:]
+approved_hosts = {
+    "aipay.ci.jenkins.sberbank.ru",
+    "ci.jenkins.sberbank.ru",
+}
+expected = urllib.parse.urlparse(expected_folder_url)
+actual = urllib.parse.urlparse(actual_url)
+if expected.hostname:
+    approved_hosts.add(expected.hostname)
+if actual.hostname not in approved_hosts:
     sys.exit(1)
-actual_name = urllib.parse.unquote(parts[-1])
-sys.exit(0 if actual_name == expected_name else 1)
+expected_folder_path = urllib.parse.unquote(expected.path.rstrip("/"))
+expected_path = f"{expected_folder_path}/job/{expected_name}"
+actual_path = urllib.parse.unquote(actual.path.rstrip("/"))
+if actual_path != expected_path:
+    sys.exit(1)
+print(f"CANONICAL_JOB_URL={actual_url.rstrip('/')}")
 PY
 }
 
@@ -851,13 +880,12 @@ verify_job_identity_from_api() {
     identity_mismatch_exit "Created Jenkins job name does not match requested job name"
   fi
 
-  if [[ "${ACTUAL_JOB_URL%/}" != "${JENKINS_URL%/}/job/"* ]]; then
-    identity_mismatch_exit "Created Jenkins job URL is not under the configured Jenkins folder URL"
-  fi
-
-  if ! job_url_points_to_name "$ACTUAL_JOB_URL" "$EXPECTED_JOB_NAME"; then
+  local identity_output
+  if ! identity_output="$(verify_job_url_identity "$JENKINS_URL" "$ACTUAL_JOB_URL" "$EXPECTED_JOB_NAME" 2>/dev/null)"; then
     identity_mismatch_exit "Created Jenkins job URL does not point to the requested job name"
   fi
+  CANONICAL_JOB_URL="$(sed -n 's/^CANONICAL_JOB_URL=//p' <<<"$identity_output" | tail -n 1)"
+  [[ -n "$CANONICAL_JOB_URL" ]] && JOB_URL="$CANONICAL_JOB_URL"
 
   JOB_IDENTITY_VERIFIED=true
 }
@@ -880,6 +908,15 @@ def csv(values):
 def lname(elem):
     return elem.tag.rsplit("}", 1)[-1]
 
+def path_join(parent, elem):
+    return f"{parent}/{lname(elem)}"
+
+def iter_with_path(elem, path=""):
+    current = path_join(path, elem)
+    yield elem, current
+    for child in list(elem):
+        yield from iter_with_path(child, current)
+
 def looks_like_repo_url(value):
     return bool(
         value
@@ -890,18 +927,68 @@ def looks_like_repo_url(value):
         )
     )
 
-def first_repo(root):
-    for elem in root.iter():
-        if lname(elem).lower() in {"url", "remote", "repositoryurl", "repository"}:
+def properties_content_value(value, key):
+    for line in (value or "").splitlines():
+        current_key, sep, current_value = line.partition("=")
+        if sep and current_key.strip() == key:
+            return current_value.strip()
+    return ""
+
+def repository_fields(root):
+    fields = []
+    seen = set()
+
+    def add(path, value):
+        value = (value or "").strip()
+        if not value:
+            return
+        item = (path, value)
+        if item not in seen:
+            fields.append(item)
+            seen.add(item)
+
+    for elem, path in iter_with_path(root):
+        name = lname(elem)
+        lower = name.lower()
+        if name == "propertiesContent":
+            repo_url = properties_content_value(elem.text or "", "REPO_URL")
+            if repo_url:
+                add(f"{path}/REPO_URL", repo_url)
+        if lower in {"url", "remote", "remoteurl", "repositoryurl", "repository"}:
             value = (elem.text or "").strip()
             if looks_like_repo_url(value):
-                return value
-    return ""
+                add(path, value)
+
+    for container, container_path in iter_with_path(root):
+        if lname(container) != "parameterDefinitions":
+            continue
+        for param in list(container):
+            param_path = path_join(container_path, param)
+            param_name = ""
+            for child in list(param):
+                if lname(child) == "name" and child.text:
+                    param_name = child.text.strip()
+                    break
+            if param_name != "BRANCH":
+                continue
+            for child in list(param):
+                if lname(child) == "remoteURL":
+                    add(path_join(param_path, child), child.text or "")
+    return fields
 
 def first_script_path(root):
     for elem in root.iter():
         if lname(elem) == "scriptPath":
             return (elem.text or "").strip()
+    return ""
+
+def first_branch_spec(root):
+    for elem in root.iter():
+        if lname(elem) != "BranchSpec":
+            continue
+        for child in list(elem):
+            if lname(child) == "name":
+                return (child.text or "").strip()
     return ""
 
 def params(root):
@@ -927,13 +1014,18 @@ except Exception as exc:
     print(f"VERIFY_REASON=Created job config.xml could not be parsed: {exc}")
     sys.exit(1)
 
-actual_repo = first_repo(root)
+repo_fields = repository_fields(root)
+actual_repo = repo_fields[0][1] if repo_fields else ""
 actual_script = first_script_path(root)
+pipeline_branch_spec = first_branch_spec(root)
 parameter_values = params(root)
 missing = sorted(required - set(parameter_values))
+repo_mismatches = sorted(path for path, value in repo_fields if expected_repo and value != expected_repo)
 
 print(f"ACTUAL_REPOSITORY_URL={actual_repo}")
+print(f"REPOSITORY_MISMATCH_PATHS={','.join(repo_mismatches)}")
 print(f"SCRIPT_PATH={actual_script}")
+print(f"PIPELINE_SCM_BRANCH_SPEC={pipeline_branch_spec}")
 print(f"REQUIRED_PARAMETERS_OK={'false' if missing else 'true'}")
 print(f"REQUIRED_PARAMETERS={csv(required)}")
 print(f"SUPPORTED_PARAMETERS={csv(parameter_values)}")
@@ -943,7 +1035,7 @@ print(f"DISTRIBUTION_TYPE_PARAMETER_SUPPORTED={'true' if 'DISTRIBUTION_TYPE' in 
 print(f"MISSING_PARAMETERS={','.join(missing)}")
 print(f"BRANCH_DEFAULT={parameter_values.get('BRANCH', '')}")
 
-if expected_repo and actual_repo != expected_repo:
+if repo_mismatches:
     print("VERIFY_STATE=jenkins_created_job_repository_mismatch")
     print("VERIFY_REASON=Created Jenkins job repository URL does not match current project repository")
     sys.exit(1)
@@ -967,6 +1059,9 @@ if rendered_config:
         print(f"EXPECTED_SCRIPT_PATH={rendered_script}")
         print(f"ACTUAL_SCRIPT_PATH={actual_script}")
         sys.exit(1)
+    rendered_branch_spec = first_branch_spec(rendered_root)
+    if rendered_branch_spec != pipeline_branch_spec:
+        print("WARNING=Pipeline SCM BranchSpec differs from rendered template")
 
 sys.exit(0)
 PY
@@ -1002,16 +1097,24 @@ apply_parameter_metadata() {
   [[ -n "$DISTRIBUTION_TYPE_PARAMETER_SUPPORTED" ]] || DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=false
 }
 
+apply_config_verification_metadata() {
+  local verify_output="$1"
+  ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
+  REPOSITORY_MISMATCH_PATHS="$(sed -n 's/^REPOSITORY_MISMATCH_PATHS=//p' "$verify_output" | tail -n 1)"
+  SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
+  PIPELINE_SCM_BRANCH_SPEC="$(sed -n 's/^PIPELINE_SCM_BRANCH_SPEC=//p' "$verify_output" | tail -n 1)"
+  REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
+  WARNING="$(sed -n 's/^WARNING=//p' "$verify_output" | tail -n 1)"
+  apply_parameter_metadata "$verify_output"
+}
+
 verify_created_job_config() {
   local verify_output="$1"
   local scan_output="$2"
   local compare_output="$3"
 
   if ! inspect_job_config "$READBACK_CONFIG_FILE" "$RENDERED_CONFIG_FILE" "$verify_output"; then
-    ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
-    SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
-    REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
-    apply_parameter_metadata "$verify_output"
+    apply_config_verification_metadata "$verify_output"
     local state reason
     state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
     reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
@@ -1022,10 +1125,7 @@ verify_created_job_config() {
       *) config_mismatch_exit "${reason:-Created Jenkins job config verification failed}" ;;
     esac
   fi
-  ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
-  SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
-  REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
-  apply_parameter_metadata "$verify_output"
+  apply_config_verification_metadata "$verify_output"
 
   if ! verify_config_scan "$READBACK_CONFIG_FILE" "$scan_output"; then
     TEMPLATE_REFERENCE_PATHS="$(sed -n 's/^TEMPLATE_REFERENCE_PATHS=//p' "$scan_output" | tail -n 1)"
@@ -1075,10 +1175,7 @@ verify_existing_job_before_build() {
 
   verify_output="${TMP_DIR}/verify-existing-job.out"
   if ! inspect_job_config "$READBACK_CONFIG_FILE" "" "$verify_output"; then
-    ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
-    SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
-    REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
-    apply_parameter_metadata "$verify_output"
+    apply_config_verification_metadata "$verify_output"
     local state reason
     state="$(sed -n 's/^VERIFY_STATE=//p' "$verify_output" | tail -n 1)"
     reason="$(sed -n 's/^VERIFY_REASON=//p' "$verify_output" | tail -n 1)"
@@ -1088,10 +1185,7 @@ verify_existing_job_before_build() {
       *) config_mismatch_exit "${reason:-Existing Jenkins job config verification failed}" ;;
     esac
   fi
-  ACTUAL_REPOSITORY_URL="$(sed -n 's/^ACTUAL_REPOSITORY_URL=//p' "$verify_output" | tail -n 1)"
-  SCRIPT_PATH="$(sed -n 's/^SCRIPT_PATH=//p' "$verify_output" | tail -n 1)"
-  REQUIRED_PARAMETERS_OK="$(sed -n 's/^REQUIRED_PARAMETERS_OK=//p' "$verify_output" | tail -n 1)"
-  apply_parameter_metadata "$verify_output"
+  apply_config_verification_metadata "$verify_output"
   JOB_CONFIGURATION_VERIFIED=true
 }
 
@@ -1104,6 +1198,9 @@ emit_job_ready() {
   echo "REPOSITORY_URL=${REPOSITORY_URL:-}"
   echo "BRANCH=${BRANCH}"
   echo "SCRIPT_PATH=${SCRIPT_PATH:-}"
+  echo "PIPELINE_SCM_BRANCH_SPEC=${PIPELINE_SCM_BRANCH_SPEC:-}"
+  echo "REPOSITORY_MISMATCH_PATHS=${REPOSITORY_MISMATCH_PATHS:-}"
+  echo "WARNING=${WARNING:-}"
   echo "REQUIRED_PARAMETERS_OK=${REQUIRED_PARAMETERS_OK:-false}"
   echo "REQUIRED_PARAMETERS=${REQUIRED_PARAMETERS:-}"
   echo "SUPPORTED_PARAMETERS=${SUPPORTED_PARAMETERS:-}"
@@ -1382,7 +1479,7 @@ create_job_from_template() {
     return 0
   fi
 
-  resolve_repository_url
+  [[ -n "$REPOSITORY_URL" ]] || resolve_repository_url
   EXPECTED_REPOSITORY_URL="$REPOSITORY_URL"
 
   local template_url create_status create_name_encoded render_output verify_output readback_status api_job_url
@@ -1421,10 +1518,12 @@ create_job_from_template() {
   curl_args+=("${JENKINS_URL}/createItem?name=${create_name_encoded}")
   create_status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
 
-  case "$create_status" in
-    200|201|302)
-      ACTION="created"
-      ;;
+	  case "$create_status" in
+	    200|201|302)
+	      ACTION="created"
+	      JOB_CREATED=true
+	      MUTATIONS_PERFORMED=true
+	      ;;
     400)
       error_exit "Jenkins refused to create job ${JOB_NAME}: HTTP ${create_status}. It may already exist." "Jenkins job name or template job"
       ;;
@@ -1931,9 +2030,10 @@ EOF
         --wait \
         --timeout-seconds "$timeout_seconds"
     )"
-    rc=$?
-    set -e
-    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
+	    rc=$?
+	    set -e
+	    printf '%s\n' "$output" >"$case_dir/output"
+	    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
       printf '%s\n' "$output"
       echo "FAIL ${scenario} expected success"
       exit 1
@@ -2118,7 +2218,23 @@ XML
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
   <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
-  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+  <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
+</project>
+XML
+  elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "properties-content-reference" ]]; then
+    cat <<'XML'
+<project>
+  <displayName>ai-payments-merchant-registry</displayName>
+  <description>Build ai-payments-merchant-registry</description>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry
+CUSTOM_PROJECT=ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
     <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
@@ -2144,11 +2260,13 @@ XML
   <displayName>ai-payments-merchant-registry</displayName>
   <description>Build ai-payments-merchant-registry</description>
   <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
-  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
-    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue></hudson.model.StringParameterDefinition>
-    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+  <properties><EnvInjectJobProperty><info><propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry</propertiesContent></info></EnvInjectJobProperty><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop-corp</defaultValue><remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>D-00.000.</defaultValue></hudson.model.StringParameterDefinition>
     <hudson.model.StringParameterDefinition><name>DISTRIBUTION_TYPE</name><defaultValue>ift</defaultValue></hudson.model.StringParameterDefinition>
   </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+  <definition><scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs><branches><hudson.plugins.git.BranchSpec><name>2.0</name></hudson.plugins.git.BranchSpec></branches></scm></definition>
 </project>
 XML
   fi
@@ -2229,7 +2347,11 @@ PY
       if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "readback-name-mismatch" ]]; then
         name="wrong-job"
       fi
-      if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-created-job-url" ]]; then
+      if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "canonical-host-alias" ]]; then
+        printf '{"name":"%s","url":"https://ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/%s/"}\n' "$name" "$name" >"$output"
+      elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-canonical-folder" ]]; then
+        printf '{"name":"%s","url":"https://ci.jenkins.sberbank.ru/job/aipay/job/OtherFolder/job/%s/"}\n' "$name" "$name" >"$output"
+      elif [[ "$JENKINS_JOB_CREATE_SCENARIO" == "wrong-created-job-url" ]]; then
         printf '{"name":"%s","url":"https://example.invalid/job/other-folder/job/%s/"}\n' "$name" "$name" >"$output"
       else
         printf '{"name":"%s","url":"https://example.invalid/job/folder/job/%s/"}\n' "$name" "$name" >"$output"
@@ -2336,10 +2458,11 @@ EOF
         --distribution-type ift \
         --version IFT-0.0.1 \
         "$@"
-    )"
-    rc=$?
-    set -e
-    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
+	    )"
+	    rc=$?
+	    set -e
+	    printf '%s\n' "$output" >"$case_dir/output"
+	    if [[ "$expected_status" == "success" && $rc -ne 0 ]]; then
       printf '%s\n' "$output"
       echo "FAIL ${scenario} expected success"
       exit 1
@@ -2353,11 +2476,11 @@ EOF
     create_count="$(cat "$case_dir/create-count" 2>/dev/null || echo 0)"
     build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
     case "$scenario" in
-      missing-repository-url|incompatible-template|missing-branch-template|hidden-shell-reference)
+      missing-repository-url|incompatible-template|missing-branch-template|hidden-shell-reference|properties-content-reference)
         [[ "$create_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create before review"; exit 1; }
         [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
         ;;
-      readback-repo-mismatch|readback-script-path-mismatch|readback-missing-version|wrong-created-job-url|readback-injected-reference|readback-hidden-difference)
+      readback-repo-mismatch|readback-script-path-mismatch|readback-missing-version|wrong-created-job-url|wrong-canonical-folder|readback-injected-reference|readback-hidden-difference)
         [[ "$create_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} create count ${create_count}"; exit 1; }
         [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build before verification"; exit 1; }
         ;;
@@ -2408,6 +2531,11 @@ EOF
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
   ! grep -q "ai-payments-merchant-registry" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL template project remains after render"; exit 1; }
   grep -q "ssh://git@example.org/team/ai-payments-auth.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL rendered repository missing"; exit 1; }
+  grep -q "REPO_URL=ssh://git@example.org/team/ai-payments-auth.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL EnvInject REPO_URL missing"; exit 1; }
+  grep -q "SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL SONAR_PROJECT_KEY missing"; exit 1; }
+  grep -q "<remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL BRANCH remoteURL missing"; exit 1; }
+  grep -q "<name>2.0</name>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL BranchSpec changed"; exit 1; }
+  grep -q "VERSION=IFT-0.0.1" "$tmp/explicit-job-name/trigger-url" || { echo "FAIL trigger did not contain exact version"; exit 1; }
 
   run_create_case generated-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
@@ -2417,6 +2545,13 @@ EOF
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
   ! grep -q "DISTRIBUTION_TYPE" "$tmp/no-distribution-type-template/trigger-url" || { echo "FAIL unsupported distribution type parameter sent"; exit 1; }
+
+  run_create_case canonical-host-alias success "JOB_IDENTITY_VERIFIED=true" \
+    --jenkins-url https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+  grep -q "CANONICAL_JOB_URL=https://ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/ai-payments-auth-build" "$tmp/canonical-host-alias/output" || { echo "FAIL canonical Jenkins URL alias not reported"; exit 1; }
 
   run_create_case readback-harmless-metadata success "JOB_CONFIGURATION_VERIFIED=true" \
     --job-name ai-payments-auth-build \
@@ -2442,7 +2577,21 @@ EOF
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
 
+  run_create_case properties-content-reference failure "STATE=jenkins_template_requires_review" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+
   run_create_case readback-repo-mismatch failure "STATE=jenkins_created_job_repository_mismatch" \
+    --job-name ai-payments-auth-build \
+    --skip-lookup \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git
+  grep -q "MUTATIONS_PERFORMED=true" "$tmp/readback-repo-mismatch/output" || { echo "FAIL created job mutation not reported"; exit 1; }
+  grep -q "CREATED_JOB_REQUIRES_REVIEW=true" "$tmp/readback-repo-mismatch/output" || { echo "FAIL created job review flag missing"; exit 1; }
+  grep -q "REPOSITORY_MISMATCH_PATHS=/project" "$tmp/readback-repo-mismatch/output" || { echo "FAIL repository mismatch paths missing"; exit 1; }
+
+  run_create_case wrong-canonical-folder failure "STATE=jenkins_created_job_identity_mismatch" \
+    --jenkins-url https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI \
     --job-name ai-payments-auth-build \
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
@@ -2608,8 +2757,10 @@ WAIT=false
 TIMEOUT_SECONDS=1800
 RECOVERY_WINDOW_SECONDS=3600
 ACTION=""
+JOB_CREATED=false
 JOB_NAME=""
 JOB_URL=""
+CANONICAL_JOB_URL=""
 REQUESTED_JOB_NAME=""
 CREATED_JOB_NAME=""
 JOB_NAME_SOURCE=""
@@ -2623,7 +2774,10 @@ TEMPLATE_REPOSITORY_URL=""
 TEMPLATE_PROJECT_SLUG=""
 TEMPLATE_REFERENCE_PATHS=""
 CONFIG_DIFF_PATHS=""
+REPOSITORY_MISMATCH_PATHS=""
 SCRIPT_PATH=""
+PIPELINE_SCM_BRANCH_SPEC=""
+WARNING=""
 JOB_IDENTITY_VERIFIED=false
 REQUIRED_PARAMETERS_OK=false
 REQUIRED_PARAMETERS=""
@@ -2771,8 +2925,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$JENKINS_URL" ]] || error_exit "Missing Jenkins URL" "JENKINS_URL"
-resolve_project_name
-resolve_branch
+[[ -n "$PROJECT_NAME" ]] || resolve_project_name
+[[ -n "$BRANCH" ]] || resolve_branch
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
 [[ "$RECOVERY_WINDOW_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--recovery-window-seconds must be a number" "recovery window seconds"
 if [[ "$SKIP_LOOKUP" == "true" && -z "$JOB_NAME_ARG" ]]; then

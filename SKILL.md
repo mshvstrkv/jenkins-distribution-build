@@ -47,6 +47,7 @@ Map user intent directly to the wrapper CLI:
 - "поставь существующую версию на тест" -> deployment flow without inventing a new build, if the CLI supports that mode; otherwise report the exact wrapper error
 - "собери релиз" -> pass `--distribution-type release`
 - "тестовая версия" or "тестовый стенд" -> pass `--distribution-type ift`
+- "IFT-дистрибутив" or "IFT distributive" -> pass `--distribution-type ift`
 
 If the user asks for build plus deploy, do not ask separately whether deployment is needed. The original request is the deployment confirmation.
 
@@ -426,6 +427,12 @@ If the user asks for a test distributive, pass:
 
 `--distribution-type ift`
 
+If the user says "IFT-дистрибутив", this already means:
+
+`--distribution-type ift`
+
+Do not ask the distribution type again.
+
 If the user asks for a release distributive, pass:
 
 `--distribution-type release`
@@ -537,8 +544,11 @@ Preflight checks:
 - deployment state
 
 If wrappers return `STATUS=ERROR`, stop immediately and report:
+- `STATE`
 - `REASON`
 - `NEXT_REQUIRED_INPUT`
+
+Do not propose manual Jenkins identity confirmation after wrapper errors.
 
 Do not run network diagnostics such as `nslookup`, `nc`, `openssl s_client`, proxy inspection, certificate inspection, or hostname substitution.
 

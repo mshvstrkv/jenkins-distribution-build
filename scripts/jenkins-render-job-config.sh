@@ -283,6 +283,26 @@ def set_default_value(param, value):
             child.text = value
             return
 
+def xml_path(parent, elem):
+    return f"{parent}/{lname(elem)}"
+
+def render_properties_content(value, mapping):
+    if value is None:
+        return value
+    rendered = []
+    for line in value.splitlines():
+        key, sep, current = line.partition("=")
+        if sep and key.strip() in mapping:
+            rendered.append(f"{key}={mapping[key.strip()]}")
+        else:
+            rendered.append(line)
+    return "\n".join(rendered)
+
+def set_direct_child_text(elem, child_name, value):
+    for child in list(elem):
+        if lname(child) == child_name:
+            child.text = value
+
 try:
     tree = ET.parse(template_config)
 except Exception as exc:
@@ -304,7 +324,7 @@ if missing:
 repo_fields = []
 for elem in root.iter():
     name = lname(elem).lower()
-    if name in {"url", "remote", "repositoryurl", "repository"} and looks_like_repo_url(text(elem)):
+    if name in {"url", "remote", "remoteurl", "repositoryurl", "repository"} and looks_like_repo_url(text(elem)):
         repo_fields.append(elem)
 
 if not repo_fields:
@@ -324,6 +344,14 @@ if not repository_url:
 for elem in repo_fields:
     elem.text = repository_url
 
+env_key_mapping = {
+    "REPO_URL": repository_url,
+    "SONAR_PROJECT_KEY": f"com.sber.aipay:{project_name}",
+}
+for elem in root.iter():
+    if lname(elem) == "propertiesContent":
+        elem.text = render_properties_content(elem.text or "", env_key_mapping)
+
 approved_text_fields = {"displayName", "description", "defaultValue"}
 for elem in root.iter():
     if lname(elem) not in approved_text_fields or elem.text is None:
@@ -339,13 +367,11 @@ for elem in root.iter():
 for name, param in params.items():
     if name == "BRANCH":
         set_default_value(param, branch)
+        set_direct_child_text(param, "remoteURL", repository_url)
     elif name in {"PROJECT_NAME", "PROJECT", "SERVICE_NAME", "APP_NAME", "APPLICATION_NAME"}:
         set_default_value(param, project_name)
     elif name == "JOB_NAME":
         set_default_value(param, job_name)
-
-def xml_path(parent, elem):
-    return f"{parent}/{lname(elem)}"
 
 references = []
 if template_project_slug and template_project_slug != project_name:
@@ -408,7 +434,7 @@ PY
 }
 
 run_self_tests() {
-  local tmp template rendered output rc bad_template missing_branch_template no_dtype_template no_dtype_rendered hidden_shell downstream notification created_metadata created_hidden
+  local tmp template rendered output rc bad_template missing_branch_template no_dtype_template no_dtype_rendered hidden_shell downstream notification bad_properties created_metadata created_hidden
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   template="$tmp/template.xml"
@@ -420,6 +446,7 @@ run_self_tests() {
   hidden_shell="$tmp/hidden-shell.xml"
   downstream="$tmp/downstream.xml"
   notification="$tmp/notification.xml"
+  bad_properties="$tmp/bad-properties.xml"
   created_metadata="$tmp/created-metadata.xml"
   created_hidden="$tmp/created-hidden.xml"
 
@@ -435,11 +462,19 @@ run_self_tests() {
     </userRemoteConfigs>
   </scm>
   <properties>
+    <EnvInjectJobProperty>
+      <info>
+        <propertiesContent>REPO_URL=ssh://git@example.org/team/ai-payments-merchant-registry.git
+SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-merchant-registry
+STATIC_VALUE=keep</propertiesContent>
+      </info>
+    </EnvInjectJobProperty>
     <hudson.model.ParametersDefinitionProperty>
       <parameterDefinitions>
         <hudson.model.StringParameterDefinition>
           <name>BRANCH</name>
           <defaultValue>develop-corp</defaultValue>
+          <remoteURL>ssh://git@example.org/team/ai-payments-merchant-registry.git</remoteURL>
         </hudson.model.StringParameterDefinition>
         <hudson.model.StringParameterDefinition>
           <name>VERSION</name>
@@ -452,6 +487,20 @@ run_self_tests() {
       </parameterDefinitions>
     </hudson.model.ParametersDefinitionProperty>
   </properties>
+  <definition>
+    <scm>
+      <userRemoteConfigs>
+        <hudson.plugins.git.UserRemoteConfig>
+          <url>ssh://git@example.org/team/ai-payments-merchant-registry.git</url>
+        </hudson.plugins.git.UserRemoteConfig>
+      </userRemoteConfigs>
+      <branches>
+        <hudson.plugins.git.BranchSpec>
+          <name>2.0</name>
+        </hudson.plugins.git.BranchSpec>
+      </branches>
+    </scm>
+  </definition>
 </project>
 XML
 
@@ -466,6 +515,10 @@ XML
   grep -q "ssh://git@example.org/team/ai-payments-auth.git" "$rendered" || { echo "FAIL repository replacement"; exit 1; }
   ! grep -q "ai-payments-merchant-registry" "$rendered" || { echo "FAIL template project reference remains"; exit 1; }
   grep -q "<defaultValue>feature/test</defaultValue>" "$rendered" || { echo "FAIL branch default replacement"; exit 1; }
+  grep -q "REPO_URL=ssh://git@example.org/team/ai-payments-auth.git" "$rendered" || { echo "FAIL EnvInject REPO_URL replacement"; exit 1; }
+  grep -q "SONAR_PROJECT_KEY=com.sber.aipay:ai-payments-auth" "$rendered" || { echo "FAIL SONAR_PROJECT_KEY replacement"; exit 1; }
+  grep -q "<remoteURL>ssh://git@example.org/team/ai-payments-auth.git</remoteURL>" "$rendered" || { echo "FAIL BRANCH remoteURL replacement"; exit 1; }
+  grep -q "<name>2.0</name>" "$rendered" || { echo "FAIL BranchSpec changed"; exit 1; }
   grep -q "DISTRIBUTION_TYPE_PARAMETER_SUPPORTED=true" "$tmp/render.out" || { echo "FAIL distribution type supported output"; exit 1; }
 
   grep -v '<name>DISTRIBUTION_TYPE</name>' "$template" >"$no_dtype_template"
@@ -563,6 +616,26 @@ PY
   [[ $rc -ne 0 ]] || { echo "FAIL notification reference accepted"; exit 1; }
   grep -q "STATE=jenkins_template_requires_review" <<<"$output" || { echo "FAIL notification state"; exit 1; }
   grep -q "/project/publishers/hudson.tasks.Mailer/recipients" <<<"$output" || { echo "FAIL notification path"; exit 1; }
+
+  python3 - "$template" "$bad_properties" <<'PY'
+import sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+text = text.replace("STATIC_VALUE=keep", "CUSTOM_PROJECT=ai-payments-merchant-registry")
+open(target, "w", encoding="utf-8").write(text)
+PY
+  set +e
+  output="$(bash "$0" \
+    --template-config "$bad_properties" \
+    --project-name ai-payments-auth \
+    --job-name ai-payments-auth-build \
+    --repository-url ssh://git@example.org/team/ai-payments-auth.git \
+    --branch feature/test 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL hidden propertiesContent reference accepted"; exit 1; }
+  grep -q "STATE=jenkins_template_requires_review" <<<"$output" || { echo "FAIL propertiesContent reference state"; exit 1; }
+  grep -q "/project/properties/EnvInjectJobProperty/info/propertiesContent" <<<"$output" || { echo "FAIL propertiesContent reference path"; exit 1; }
 
   grep -v '<name>VERSION</name>' "$template" >"$bad_template"
   set +e
