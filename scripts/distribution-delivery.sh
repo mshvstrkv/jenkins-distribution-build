@@ -71,6 +71,9 @@ Usage:
     [--preflight] \
     [--approve-deployment] \
     [--dry-run] \
+    [--no-extra-gitops-changes] \
+    [--additional-gitops-changes-required] \
+    [--resume-gitops --build-url <url> --version <version> --digest <digest>] \
     [--wait]
 
 Use --approve-deployment to allow the GitOps push and Argo CD stage.
@@ -143,6 +146,269 @@ run_self_tests() {
   if ( validate_rendered_path "charts/project/../../other" "test path" ) >/dev/null 2>&1; then echo "FAIL unsafe nested parent path"; failed=1; fi
 
   PROJECT_NAME="$old_project"; ENVIRONMENT="$old_env"; DISTRIBUTION_TYPE="$old_dtype"; VERSION="$old_version"; ARGOCD_DESTINATION_NAMESPACE="$old_ns"; ARGOCD_APP_NAME="$old_app"; CONFIG_PATH="$old_config"; CONFIG_TEMPLATE_PATH="$old_template"; CHARTS_PATH="$old_charts"
+
+  local order_log argo_count
+  order_log="$(mktemp)"
+  reset_deploy_preconditions
+  {
+    echo build
+    echo digest
+  } >>"$order_log"
+  DIGEST_BUILD_MATCH=true
+  CHARTS_UPDATED=true; echo chart >>"$order_log"
+  CONFIGS_UPDATED=true; echo config >>"$order_log"
+  FILES_EXPECTED=2
+  FILES_VERIFIED=2
+  FILES_FAILED=0
+  VERSION_APPLIED=true
+  DIGEST_APPLIED=true
+  COMMIT_CREATED=true; echo commit >>"$order_log"
+  COMMIT_SHA=abc123
+  PUSH_COMPLETED=true; echo push >>"$order_log"
+  REMOTE_GIT_VERIFIED=true; echo remote >>"$order_log"
+  REMOTE_COMMIT_SHA=abc123
+  refresh_argo_deploy_allowed
+  if [[ "$ARGO_DEPLOY_ALLOWED" == "true" ]]; then
+    echo argocd >>"$order_log"
+  fi
+  if [[ "$(tr '\n' ' ' <"$order_log" | sed 's/[[:space:]]*$//')" != "build digest chart config commit push remote argocd" ]]; then
+    echo "FAIL deploy order success"
+    failed=1
+  fi
+
+  : >"$order_log"
+  reset_deploy_preconditions
+  {
+    echo build
+    echo digest
+  } >>"$order_log"
+  DIGEST_BUILD_MATCH=true
+  CHARTS_UPDATED=true; echo chart >>"$order_log"
+  CONFIGS_UPDATED=true; echo config >>"$order_log"
+  FILES_EXPECTED=2
+  FILES_VERIFIED=2
+  FILES_FAILED=0
+  VERSION_APPLIED=true
+  DIGEST_APPLIED=true
+  COMMIT_CREATED=true; echo commit >>"$order_log"
+  COMMIT_SHA=abc123
+  PUSH_COMPLETED=false; echo "push FAILED" >>"$order_log"
+  REMOTE_GIT_VERIFIED=false
+  REMOTE_COMMIT_SHA=""
+  refresh_argo_deploy_allowed
+  [[ "$ARGO_DEPLOY_ALLOWED" == "false" ]] || { echo "FAIL push failure allowed Argo"; failed=1; }
+  argo_count="$(grep -c '^argocd$' "$order_log" || true)"
+  [[ "$argo_count" == "0" ]] || { echo "FAIL push failure Argo count"; failed=1; }
+
+  : >"$order_log"
+  reset_deploy_preconditions
+  {
+    echo build
+    echo digest
+  } >>"$order_log"
+  DIGEST_BUILD_MATCH=true
+  CHARTS_UPDATED=false
+  CONFIGS_UPDATED=true
+  FILES_EXPECTED=2
+  FILES_VERIFIED=1
+  FILES_FAILED=1
+  VERSION_APPLIED=true
+  DIGEST_APPLIED=true
+  COMMIT_CREATED=true
+  COMMIT_SHA=abc123
+  PUSH_COMPLETED=true
+  REMOTE_GIT_VERIFIED=true
+  REMOTE_COMMIT_SHA=abc123
+  refresh_argo_deploy_allowed
+  [[ "$ARGO_DEPLOY_ALLOWED" == "false" ]] || { echo "FAIL chart failure allowed Argo"; failed=1; }
+  argo_count="$(grep -c '^argocd$' "$order_log" || true)"
+  [[ "$argo_count" == "0" ]] || { echo "FAIL chart failure Argo count"; failed=1; }
+
+  local field
+  local output rc expected_state
+  for field in DIGEST_BUILD_MATCH CHARTS_UPDATED CONFIGS_UPDATED VERSION_APPLIED DIGEST_APPLIED COMMIT_CREATED PUSH_COMPLETED REMOTE_GIT_VERIFIED; do
+    : >"$order_log"
+    reset_deploy_preconditions
+    DIGEST_BUILD_MATCH=true
+    CHARTS_UPDATED=true
+    CONFIGS_UPDATED=true
+    FILES_EXPECTED=2
+    FILES_VERIFIED=2
+    FILES_FAILED=0
+    VERSION_APPLIED=true
+    DIGEST_APPLIED=true
+    COMMIT_CREATED=true
+    COMMIT_SHA=abc123
+    PUSH_COMPLETED=true
+    REMOTE_GIT_VERIFIED=true
+    REMOTE_COMMIT_SHA=abc123
+    printf -v "$field" '%s' false
+    refresh_argo_deploy_allowed
+    [[ "$ARGO_DEPLOY_ALLOWED" == "false" ]] || { echo "FAIL ${field} failure allowed Argo"; failed=1; }
+    argo_count="$(grep -c '^argocd$' "$order_log" || true)"
+    [[ "$argo_count" == "0" ]] || { echo "FAIL ${field} Argo count"; failed=1; }
+    case "$field" in
+      DIGEST_BUILD_MATCH) expected_state="digest_build_mismatch" ;;
+      CHARTS_UPDATED|CONFIGS_UPDATED|COMMIT_CREATED) expected_state="gitops_not_updated" ;;
+      VERSION_APPLIED) expected_state="gitops_version_not_applied" ;;
+      DIGEST_APPLIED) expected_state="gitops_digest_not_applied" ;;
+      PUSH_COMPLETED) expected_state="gitops_push_failed" ;;
+      REMOTE_GIT_VERIFIED) expected_state="git_remote_not_updated" ;;
+      *) expected_state="" ;;
+    esac
+    set +e
+    output="$(require_argo_deploy_allowed)"
+    rc=$?
+    set -e
+    [[ $rc -ne 0 ]] || { echo "FAIL ${field} did not block Argo"; failed=1; }
+    grep -q "^STATE=${expected_state}$" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${field} state"; failed=1; }
+    grep -q "^ARGO_DEPLOY_ALLOWED=false$" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${field} allowed output"; failed=1; }
+  done
+  reset_deploy_preconditions
+  DIGEST_BUILD_MATCH=true
+  CHARTS_UPDATED=true
+  CONFIGS_UPDATED=true
+  FILES_EXPECTED=2
+  FILES_VERIFIED=2
+  FILES_FAILED=0
+  VERSION_APPLIED=true
+  DIGEST_APPLIED=true
+  COMMIT_CREATED=true
+  COMMIT_SHA=abc123
+  PUSH_COMPLETED=true
+  REMOTE_GIT_VERIFIED=true
+  REMOTE_COMMIT_SHA=def456
+  refresh_argo_deploy_allowed
+  [[ "$ARGO_DEPLOY_ALLOWED" == "false" ]] || { echo "FAIL remote sha mismatch allowed Argo"; failed=1; }
+  set +e
+  output="$(require_argo_deploy_allowed)"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { echo "FAIL remote sha mismatch did not block Argo"; failed=1; }
+  grep -q "^STATE=git_remote_not_updated$" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL remote sha mismatch state"; failed=1; }
+  rm -f "$order_log"
+
+  local action question_count gitops_count argo_count_mock
+  reset_gitops_scope_flags
+  action="$(gitops_scope_action)"
+  [[ "$action" == "ask" ]] || { echo "FAIL gitops scope initial pause"; failed=1; }
+  question_count=1
+  NO_EXTRA_GITOPS_CHANGES=true
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL gitops scope no proceeds"; failed=1; }
+  {
+    echo build
+    echo digest
+    echo pause
+    echo version+digest
+    echo verify
+    echo commit
+    echo push
+    echo remote
+    echo argo
+  } >"$order_log"
+  [[ "$(tr '\n' ' ' <"$order_log" | sed 's/[[:space:]]*$//')" == "build digest pause version+digest verify commit push remote argo" ]] || { echo "FAIL gitops scope no order"; failed=1; }
+  [[ "$question_count" == "1" ]] || { echo "FAIL gitops scope question count"; failed=1; }
+
+  reset_gitops_scope_flags
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED=true
+  action="$(gitops_scope_action)"
+  [[ "$action" == "additional_required" ]] || { echo "FAIL gitops scope yes pauses"; failed=1; }
+  gitops_count=0
+  argo_count_mock=0
+  [[ "$gitops_count" == "0" && "$argo_count_mock" == "0" ]] || { echo "FAIL gitops scope yes mutation count"; failed=1; }
+
+  RESUME_GITOPS=true
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL gitops scope resume proceeds"; failed=1; }
+  gitops_count=1
+  argo_count_mock=1
+  [[ "$gitops_count" == "1" && "$argo_count_mock" == "1" ]] || { echo "FAIL gitops scope resume counts"; failed=1; }
+
+  reset_gitops_scope_flags
+  NO_EXTRA_GITOPS_CHANGES=true
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL gitops scope no repeat first"; failed=1; }
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL gitops scope no repeat second"; failed=1; }
+
+  local state_tmp state_project state_file saved_project_dir
+  local old_project_dir="${PROJECT_DIR:-}" old_project_name="${PROJECT_NAME:-}" old_build_url="${BUILD_URL:-}" old_build_number="${BUILD_NUMBER:-}" old_version_state="${VERSION:-}" old_dtype_state="${DISTRIBUTION_TYPE:-}" old_image_digest="${IMAGE_DIGEST:-}" old_resume_state_file="${RESUME_STATE_FILE:-}" old_resume="${RESUME_GITOPS:-false}" old_no_extra="${NO_EXTRA_GITOPS_CHANGES:-false}" old_additional="${ADDITIONAL_GITOPS_CHANGES_REQUIRED:-false}"
+  state_tmp="$(mktemp -d)"
+  state_project="$state_tmp/application-service"
+  mkdir -p "$state_project"
+  git init "$state_project" >/dev/null
+  PROJECT_DIR="$state_project"
+  PROJECT_NAME="application-service"
+  DISTRIBUTION_TYPE="ift"
+  VERSION="IFT-0.0.27"
+  BUILD_URL="https://jenkins.example/job/application-service-build/47/"
+  IMAGE_DIGEST="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  RESUME_STATE_FILE="$(resume_state_file)"
+  save_resume_state "awaiting-gitops-scope" "false"
+  state_file="$RESUME_STATE_FILE"
+  [[ -f "$state_file" ]] || { echo "FAIL resume state not created"; failed=1; }
+  state_perms="$(stat -f "%Lp" "$state_file" 2>/dev/null || stat -c "%a" "$state_file" 2>/dev/null || true)"
+  [[ "$state_perms" == "600" ]] || { echo "FAIL resume state permissions"; failed=1; }
+  grep -q '^PAUSE_STATE=awaiting-gitops-scope$' "$state_file" || { echo "FAIL resume state pause"; failed=1; }
+  grep -q '^QUESTION_ANSWERED=false$' "$state_file" || { echo "FAIL resume state unanswered"; failed=1; }
+  if grep -Eiq '(TOKEN|PASSWORD|SECRET|CREDENTIAL|ARGOCD_AUTH_TOKEN|JENKINS_TOKEN)' "$state_file"; then
+    echo "FAIL resume state contains credential key"
+    failed=1
+  fi
+
+  BUILD_URL=""
+  BUILD_NUMBER=""
+  VERSION=""
+  IMAGE_DIGEST=""
+  DISTRIBUTION_TYPE=""
+  load_resume_state
+  [[ "$BUILD_URL" == "https://jenkins.example/job/application-service-build/47/" ]] || { echo "FAIL resume state build url"; failed=1; }
+  [[ "$BUILD_NUMBER" == "47" ]] || { echo "FAIL resume state build number"; failed=1; }
+  [[ "$VERSION" == "IFT-0.0.27" ]] || { echo "FAIL resume state version"; failed=1; }
+  [[ "$IMAGE_DIGEST" == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" ]] || { echo "FAIL resume state digest"; failed=1; }
+  [[ "$DISTRIBUTION_TYPE" == "ift" ]] || { echo "FAIL resume state distribution"; failed=1; }
+
+  NO_EXTRA_GITOPS_CHANGES=true
+  RESUME_GITOPS=false
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED=false
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL resume no-extra proceeds"; failed=1; }
+  save_resume_state "$STATE_PAUSE_STATE" "true"
+  load_resume_state
+  [[ "$STATE_QUESTION_ANSWERED" == "true" ]] || { echo "FAIL resume no-extra answered"; failed=1; }
+
+  save_resume_state "awaiting-gitops-scope" "false"
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED=true
+  NO_EXTRA_GITOPS_CHANGES=false
+  load_resume_state
+  save_resume_state "additional_gitops_changes_required" "true"
+  load_resume_state
+  [[ "$STATE_PAUSE_STATE" == "additional_gitops_changes_required" && "$STATE_QUESTION_ANSWERED" == "true" ]] || { echo "FAIL resume additional state"; failed=1; }
+
+  RESUME_GITOPS=true
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED=false
+  action="$(gitops_scope_action)"
+  [[ "$action" == "proceed" ]] || { echo "FAIL resume skips repeated question"; failed=1; }
+
+  save_resume_state "additional_gitops_changes_required" "true"
+  remove_resume_state
+  [[ ! -e "$state_file" ]] || { echo "FAIL resume state not removed"; failed=1; }
+
+  save_resume_state "additional_gitops_changes_required" "true"
+  [[ -e "$state_file" ]] || { echo "FAIL failed GitOps did not keep state"; failed=1; }
+  rm -rf "$state_tmp"
+  PROJECT_DIR="$old_project_dir"
+  PROJECT_NAME="$old_project_name"
+  BUILD_URL="$old_build_url"
+  BUILD_NUMBER="$old_build_number"
+  VERSION="$old_version_state"
+  DISTRIBUTION_TYPE="$old_dtype_state"
+  IMAGE_DIGEST="$old_image_digest"
+  RESUME_STATE_FILE="$old_resume_state_file"
+  RESUME_GITOPS="$old_resume"
+  NO_EXTRA_GITOPS_CHANGES="$old_no_extra"
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED="$old_additional"
 
   if [[ "$failed" == "0" ]]; then
     echo "DISTRIBUTION_DELIVERY_SELF_TESTS=OK"
@@ -475,6 +741,259 @@ deployment_mode_for_state() {
   fi
 }
 
+build_number_from_url() {
+  local url="${1%/}"
+  local number="${url##*/}"
+  if [[ "$number" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$number"
+  fi
+}
+
+resume_state_file() {
+  local git_dir
+  git_dir="$(git -C "$PROJECT_DIR" rev-parse --git-dir 2>/dev/null || true)"
+  [[ -n "$git_dir" ]] || error_exit "Project directory is not a Git repository: ${PROJECT_DIR}" "Git repository project directory"
+  if [[ "$git_dir" != /* ]]; then
+    git_dir="$(cd "$PROJECT_DIR" && cd "$git_dir" && pwd)"
+  fi
+  printf '%s/jenkins-distribution-build-state' "$git_dir"
+}
+
+resume_state_error() {
+  local state="$1"
+  local reason="$2"
+  local next_input="${3:-}"
+  echo "STATUS=ERROR"
+  echo "ACTION=resume-gitops"
+  echo "STATE=${state}"
+  echo "REASON=${reason}"
+  echo "NEXT_REQUIRED_INPUT=${next_input}"
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+save_resume_state() {
+  local pause_state="$1"
+  local answered="$2"
+  local state_file="${RESUME_STATE_FILE:-}"
+  [[ -n "$state_file" ]] || state_file="$(resume_state_file)"
+  local tmp_file="${state_file}.$$"
+  local project_root
+  project_root="$(project_git_root)"
+  BUILD_NUMBER="$(build_number_from_url "$BUILD_URL")"
+  umask 077
+  {
+    echo "PROJECT_NAME=${PROJECT_NAME}"
+    echo "PROJECT_DIR=${project_root}"
+    echo "BUILD_URL=${BUILD_URL}"
+    echo "BUILD_NUMBER=${BUILD_NUMBER}"
+    echo "VERSION=${VERSION}"
+    echo "DIGEST=${IMAGE_DIGEST}"
+    echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
+    echo "PAUSE_STATE=${pause_state}"
+    echo "QUESTION_ANSWERED=${answered}"
+  } >"$tmp_file"
+  chmod 600 "$tmp_file"
+  mv "$tmp_file" "$state_file"
+  RESUME_STATE_FILE="$state_file"
+}
+
+load_resume_state() {
+  local state_file="${RESUME_STATE_FILE:-}"
+  [[ -n "$state_file" ]] || state_file="$(resume_state_file)"
+  [[ -f "$state_file" ]] || resume_state_error "gitops_resume_state_missing" "GitOps resume state file is missing" "resume state"
+  local key value
+  STATE_PROJECT_NAME=""
+  STATE_PROJECT_DIR=""
+  STATE_BUILD_URL=""
+  STATE_BUILD_NUMBER=""
+  STATE_VERSION=""
+  STATE_DIGEST=""
+  STATE_DISTRIBUTION_TYPE=""
+  STATE_PAUSE_STATE=""
+  STATE_QUESTION_ANSWERED=""
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || resume_state_error "gitops_resume_state_invalid" "GitOps resume state is malformed" "valid resume state"
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      PROJECT_NAME) STATE_PROJECT_NAME="$value" ;;
+      PROJECT_DIR) STATE_PROJECT_DIR="$value" ;;
+      BUILD_URL) STATE_BUILD_URL="$value" ;;
+      BUILD_NUMBER) STATE_BUILD_NUMBER="$value" ;;
+      VERSION) STATE_VERSION="$value" ;;
+      DIGEST) STATE_DIGEST="$value" ;;
+      DISTRIBUTION_TYPE) STATE_DISTRIBUTION_TYPE="$value" ;;
+      PAUSE_STATE) STATE_PAUSE_STATE="$value" ;;
+      QUESTION_ANSWERED) STATE_QUESTION_ANSWERED="$value" ;;
+      *) resume_state_error "gitops_resume_state_invalid" "GitOps resume state contains unsupported key" "valid resume state" ;;
+    esac
+  done <"$state_file"
+  [[ -n "$STATE_PROJECT_NAME" && -n "$STATE_PROJECT_DIR" && -n "$STATE_BUILD_URL" && -n "$STATE_BUILD_NUMBER" && -n "$STATE_VERSION" && -n "$STATE_DIGEST" && -n "$STATE_DISTRIBUTION_TYPE" && -n "$STATE_PAUSE_STATE" && -n "$STATE_QUESTION_ANSWERED" ]] || resume_state_error "gitops_resume_state_invalid" "GitOps resume state is incomplete" "valid resume state"
+  local project_root
+  project_root="$(project_git_root)"
+  if [[ "$STATE_PROJECT_NAME" != "$PROJECT_NAME" || "$STATE_PROJECT_DIR" != "$project_root" ]]; then
+    resume_state_error "gitops_resume_project_mismatch" "GitOps resume state belongs to a different project" "matching project"
+  fi
+  BUILD_URL="$STATE_BUILD_URL"
+  BUILD_NUMBER="$STATE_BUILD_NUMBER"
+  VERSION="$STATE_VERSION"
+  IMAGE_DIGEST="$STATE_DIGEST"
+  DISTRIBUTION_TYPE="$STATE_DISTRIBUTION_TYPE"
+  RESUME_STATE_FILE="$state_file"
+}
+
+remove_resume_state() {
+  local state_file="${RESUME_STATE_FILE:-}"
+  [[ -n "$state_file" ]] || state_file="$(resume_state_file)"
+  rm -f "$state_file"
+}
+
+reset_gitops_scope_flags() {
+  NO_EXTRA_GITOPS_CHANGES=false
+  ADDITIONAL_GITOPS_CHANGES_REQUIRED=false
+  RESUME_GITOPS=false
+}
+
+gitops_scope_action() {
+  if [[ "${RESUME_GITOPS:-false}" == "true" || "${NO_EXTRA_GITOPS_CHANGES:-false}" == "true" ]]; then
+    echo "proceed"
+  elif [[ "${ADDITIONAL_GITOPS_CHANGES_REQUIRED:-false}" == "true" ]]; then
+    echo "additional_required"
+  else
+    echo "ask"
+  fi
+}
+
+emit_gitops_scope_pause() {
+  echo "STATUS=PAUSED"
+  echo "ACTION=awaiting-gitops-scope"
+  echo "STATE=awaiting_gitops_changes_decision"
+  echo "QUESTION=Кроме обновления версии и image digest нужно внести ещё изменения в charts/configs?"
+  echo "PROJECT_NAME=${PROJECT_NAME}"
+  echo "ENVIRONMENT=${ENVIRONMENT}"
+  echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
+  echo "VERSION=${VERSION}"
+  echo "BUILD_URL=${BUILD_URL:-}"
+  echo "IMAGE_DIGEST=${IMAGE_DIGEST:-}"
+  echo "DIGEST_BUILD_MATCH=${DIGEST_BUILD_MATCH:-false}"
+  echo "STANDARD_GITOPS_UPDATE_READY=true"
+  echo "GITOPS_MUTATIONS_PERFORMED=false"
+  echo "ARGOCD_SYNC_RUN=false"
+  echo "NEXT_REQUIRED_INPUT=additional GitOps changes decision"
+  echo "MUTATIONS_PERFORMED=true"
+  exit 0
+}
+
+emit_additional_gitops_changes_required() {
+  echo "STATUS=PAUSED"
+  echo "ACTION=awaiting-additional-gitops-changes"
+  echo "STATE=additional_gitops_changes_required"
+  echo "PROJECT_NAME=${PROJECT_NAME}"
+  echo "ENVIRONMENT=${ENVIRONMENT}"
+  echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
+  echo "VERSION=${VERSION}"
+  echo "BUILD_URL=${BUILD_URL:-}"
+  echo "IMAGE_DIGEST=${IMAGE_DIGEST:-}"
+  echo "DIGEST_BUILD_MATCH=${DIGEST_BUILD_MATCH:-false}"
+  echo "STANDARD_GITOPS_UPDATE_READY=true"
+  echo "GITOPS_MUTATIONS_PERFORMED=false"
+  echo "ARGOCD_SYNC_RUN=false"
+  echo "NEXT_REQUIRED_INPUT=exact additional GitOps changes"
+  echo "MUTATIONS_PERFORMED=true"
+  exit 0
+}
+
+reset_deploy_preconditions() {
+  DIGEST_BUILD_MATCH=false
+  CHARTS_UPDATED=false
+  CONFIGS_UPDATED=false
+  FILES_EXPECTED=0
+  FILES_VERIFIED=0
+  FILES_FAILED=0
+  VERIFIED_FILES=""
+  FAILED_FILES=""
+  EXPECTED_VERSION=""
+  EXPECTED_DIGEST=""
+  ACTUAL_VERSION=""
+  ACTUAL_DIGEST=""
+  VERSION_APPLIED=false
+  DIGEST_APPLIED=false
+  COMMIT_CREATED=false
+  COMMIT_SHA=""
+  PUSH_COMPLETED=false
+  REMOTE_GIT_VERIFIED=false
+  REMOTE_COMMIT_SHA=""
+  ARGO_DEPLOY_ALLOWED=false
+}
+
+refresh_argo_deploy_allowed() {
+  if [[ "${DIGEST_BUILD_MATCH:-false}" == "true" && "${FILES_FAILED:-0}" == "0" && -n "${FILES_EXPECTED:-}" && -n "${FILES_VERIFIED:-}" && "${FILES_EXPECTED:-0}" != "0" && "${FILES_VERIFIED:-0}" == "${FILES_EXPECTED:-0}" && "${CHARTS_UPDATED:-false}" == "true" && "${CONFIGS_UPDATED:-false}" == "true" && "${VERSION_APPLIED:-false}" == "true" && "${DIGEST_APPLIED:-false}" == "true" && "${COMMIT_CREATED:-false}" == "true" && -n "${COMMIT_SHA:-}" && "${PUSH_COMPLETED:-false}" == "true" && "${REMOTE_GIT_VERIFIED:-false}" == "true" && -n "${REMOTE_COMMIT_SHA:-}" && "${COMMIT_SHA:-}" == "${REMOTE_COMMIT_SHA:-}" ]]; then
+    ARGO_DEPLOY_ALLOWED=true
+  else
+    ARGO_DEPLOY_ALLOWED=false
+  fi
+}
+
+gitops_gate_error() {
+  local state="$1"
+  local reason="$2"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "STATE=${state}"
+  echo "REASON=${reason}"
+  echo "DIGEST_BUILD_MATCH=${DIGEST_BUILD_MATCH:-false}"
+  echo "CHARTS_UPDATED=${CHARTS_UPDATED:-false}"
+  echo "CONFIGS_UPDATED=${CONFIGS_UPDATED:-false}"
+  echo "FILES_EXPECTED=${FILES_EXPECTED:-0}"
+  echo "FILES_VERIFIED=${FILES_VERIFIED:-0}"
+  echo "FILES_FAILED=${FILES_FAILED:-0}"
+  echo "VERIFIED_FILES=${VERIFIED_FILES:-}"
+  echo "FAILED_FILES=${FAILED_FILES:-}"
+  echo "EXPECTED_VERSION=${EXPECTED_VERSION:-}"
+  echo "EXPECTED_DIGEST=${EXPECTED_DIGEST:-}"
+  echo "ACTUAL_VERSION=${ACTUAL_VERSION:-}"
+  echo "ACTUAL_DIGEST=${ACTUAL_DIGEST:-}"
+  echo "VERSION_APPLIED=${VERSION_APPLIED:-false}"
+  echo "DIGEST_APPLIED=${DIGEST_APPLIED:-false}"
+  echo "COMMIT_CREATED=${COMMIT_CREATED:-false}"
+  echo "COMMIT_SHA=${COMMIT_SHA:-}"
+  echo "PUSH_COMPLETED=${PUSH_COMPLETED:-false}"
+  echo "REMOTE_GIT_VERIFIED=${REMOTE_GIT_VERIFIED:-false}"
+  echo "REMOTE_COMMIT_SHA=${REMOTE_COMMIT_SHA:-}"
+  echo "ARGO_DEPLOY_ALLOWED=false"
+  echo "NEXT_REQUIRED_INPUT=successful GitOps update and push"
+  echo "MUTATIONS_PERFORMED=false"
+  exit 1
+}
+
+require_argo_deploy_allowed() {
+  refresh_argo_deploy_allowed
+  [[ "$ARGO_DEPLOY_ALLOWED" == "true" ]] && return 0
+  if [[ "${DIGEST_BUILD_MATCH:-false}" != "true" ]]; then
+    gitops_gate_error "digest_build_mismatch" "Image digest does not belong to the completed Jenkins build"
+  fi
+  if [[ "${CHARTS_UPDATED:-false}" != "true" || "${CONFIGS_UPDATED:-false}" != "true" || "${COMMIT_CREATED:-false}" != "true" ]]; then
+    gitops_gate_error "gitops_not_updated" "GitOps chart/config update was not completed"
+  fi
+  if [[ "${FILES_FAILED:-0}" != "0" || "${FILES_EXPECTED:-0}" == "0" || "${FILES_VERIFIED:-0}" != "${FILES_EXPECTED:-0}" ]]; then
+    gitops_gate_error "gitops_content_not_verified" "GitOps updated files were not fully verified"
+  fi
+  if [[ "${VERSION_APPLIED:-false}" != "true" ]]; then
+    gitops_gate_error "gitops_version_not_applied" "GitOps files do not contain the built version and image tag"
+  fi
+  if [[ "${DIGEST_APPLIED:-false}" != "true" ]]; then
+    gitops_gate_error "gitops_digest_not_applied" "GitOps files do not contain the built image digest"
+  fi
+  if [[ "${PUSH_COMPLETED:-false}" != "true" ]]; then
+    gitops_gate_error "gitops_push_failed" "GitOps push did not complete successfully"
+  fi
+  if [[ "${REMOTE_GIT_VERIFIED:-false}" != "true" || -z "${COMMIT_SHA:-}" || -z "${REMOTE_COMMIT_SHA:-}" || "${COMMIT_SHA:-}" != "${REMOTE_COMMIT_SHA:-}" ]]; then
+    gitops_gate_error "git_remote_not_updated" "Remote Git repository does not contain pushed commit"
+  fi
+  gitops_gate_error "gitops_update_failed" "GitOps update did not complete successfully"
+}
+
 clone_gitops_repo() {
   GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes}" git ls-remote --heads "$CONFIG_REPO_URL" "$CONFIG_REPO_BRANCH" >/dev/null 2>"$WORK_DIR/git-ls-remote.err" || {
     local message
@@ -622,6 +1141,7 @@ JOB_NAME=""
 TEMPLATE_JOB="${JENKINS_TEMPLATE_JOB:-}"
 DISTRIBUTION_TYPE=""
 VERSION=""
+BUILD_URL=""
 REPOSITORY_URL=""
 TIMEOUT_SECONDS=1800
 CONFIG_REPO_URL="${CONFIG_REPO_URL:-}"
@@ -645,6 +1165,33 @@ APPROVE_DEPLOYMENT=false
 JENKINS_BRANCH_PARAM="BRANCH"
 JENKINS_VERSION_PARAM="VERSION"
 JENKINS_DISTRIBUTION_TYPE_PARAM="DISTRIBUTION_TYPE"
+IMAGE_DIGEST=""
+BUILD_NUMBER=""
+RESUME_STATE_FILE=""
+RESUME_FROM_STATE=false
+DIGEST_BUILD_MATCH=false
+CHARTS_UPDATED=false
+CONFIGS_UPDATED=false
+FILES_EXPECTED=0
+FILES_VERIFIED=0
+FILES_FAILED=0
+VERIFIED_FILES=""
+FAILED_FILES=""
+EXPECTED_VERSION=""
+EXPECTED_DIGEST=""
+ACTUAL_VERSION=""
+ACTUAL_DIGEST=""
+VERSION_APPLIED=false
+DIGEST_APPLIED=false
+COMMIT_CREATED=false
+COMMIT_SHA=""
+PUSH_COMPLETED=false
+REMOTE_GIT_VERIFIED=false
+REMOTE_COMMIT_SHA=""
+ARGO_DEPLOY_ALLOWED=false
+NO_EXTRA_GITOPS_CHANGES=false
+ADDITIONAL_GITOPS_CHANGES_REQUIRED=false
+RESUME_GITOPS=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -658,6 +1205,8 @@ while [[ $# -gt 0 ]]; do
     --repository-url) require_value "$1" "${2:-}"; REPOSITORY_URL="$2"; shift 2 ;;
     --distribution-type) require_value "$1" "${2:-}"; DISTRIBUTION_TYPE="$2"; shift 2 ;;
     --version) require_value "$1" "${2:-}"; VERSION="$2"; shift 2 ;;
+    --build-url) require_value "$1" "${2:-}"; BUILD_URL="$2"; shift 2 ;;
+    --digest) require_value "$1" "${2:-}"; IMAGE_DIGEST="$2"; shift 2 ;;
     --timeout-seconds) require_value "$1" "${2:-}"; TIMEOUT_SECONDS="$2"; shift 2 ;;
     --config-repo-url) require_value "$1" "${2:-}"; CONFIG_REPO_URL="$2"; shift 2 ;;
     --config-repo-branch) require_value "$1" "${2:-}"; CONFIG_REPO_BRANCH="$2"; shift 2 ;;
@@ -675,6 +1224,9 @@ while [[ $# -gt 0 ]]; do
     --jenkins-distribution-type-param) require_value "$1" "${2:-}"; JENKINS_DISTRIBUTION_TYPE_PARAM="$2"; shift 2 ;;
     --preflight) PREFLIGHT=true; shift ;;
     --approve-deployment) APPROVE_DEPLOYMENT=true; shift ;;
+    --no-extra-gitops-changes) NO_EXTRA_GITOPS_CHANGES=true; shift ;;
+    --additional-gitops-changes-required) ADDITIONAL_GITOPS_CHANGES_REQUIRED=true; shift ;;
+    --resume-gitops) RESUME_GITOPS=true; shift ;;
     --dry-run) DRY_RUN=true; shift ;;
     --wait) shift ;;
     --help|-h) usage; exit 0 ;;
@@ -688,13 +1240,29 @@ if [[ "$PREFLIGHT" == "true" ]]; then
   exec "$SCRIPT_DIR/preflight.sh" "${ORIGINAL_ARGS[@]}"
 fi
 
-resolve_jenkins_url
+if [[ "$NO_EXTRA_GITOPS_CHANGES" == "true" && "$ADDITIONAL_GITOPS_CHANGES_REQUIRED" == "true" ]]; then
+  error_exit "Conflicting GitOps scope arguments" "choose no extra changes or additional changes"
+fi
 require_project_dir
 resolve_project_name
 resolve_branch
-[[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"
-if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$DISTRIBUTION_TYPE")"; then
-  error_exit "Unsupported distribution type" "ift or release"
+RESUME_STATE_FILE="$(resume_state_file)"
+if [[ "$RESUME_GITOPS" == "true" ]]; then
+  RESUME_FROM_STATE=true
+elif [[ "$NO_EXTRA_GITOPS_CHANGES" == "true" || "$ADDITIONAL_GITOPS_CHANGES_REQUIRED" == "true" ]]; then
+  [[ -f "$RESUME_STATE_FILE" ]] && RESUME_FROM_STATE=true
+fi
+if [[ "$RESUME_FROM_STATE" == "true" ]]; then
+  load_resume_state
+fi
+if [[ "$RESUME_FROM_STATE" != "true" ]]; then
+  resolve_jenkins_url
+fi
+if [[ "$RESUME_FROM_STATE" != "true" ]]; then
+  [[ -n "$DISTRIBUTION_TYPE" ]] || error_exit "Missing required argument: --distribution-type" "distribution type"
+  if ! DISTRIBUTION_TYPE="$(normalize_distribution_type "$DISTRIBUTION_TYPE")"; then
+    error_exit "Unsupported distribution type" "ift or release"
+  fi
 fi
 [[ "$TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || error_exit "--timeout-seconds must be a number" "timeout seconds"
 
@@ -745,6 +1313,17 @@ validate_config_path
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
+if [[ "$RESUME_FROM_STATE" == "true" ]]; then
+  reset_deploy_preconditions
+  DIGEST_BUILD_MATCH=true
+  if [[ "$ADDITIONAL_GITOPS_CHANGES_REQUIRED" == "true" && "$RESUME_GITOPS" != "true" ]]; then
+    save_resume_state "additional_gitops_changes_required" "true"
+    emit_additional_gitops_changes_required
+  fi
+  if [[ "$NO_EXTRA_GITOPS_CHANGES" == "true" || "$RESUME_GITOPS" == "true" ]]; then
+    save_resume_state "${STATE_PAUSE_STATE:-awaiting-gitops-scope}" "true"
+  fi
+else
 LOOKUP_OUTPUT="$WORK_DIR/jenkins-lookup.out"
 lookup_args=(
   "$SCRIPT_DIR/jenkins-lookup.sh"
@@ -838,6 +1417,36 @@ case "$RESULT" in
     ;;
 esac
 
+reset_deploy_preconditions
+DIGEST_OUTPUT="$WORK_DIR/digest.out"
+run_and_capture "$DIGEST_OUTPUT" bash "$SCRIPT_DIR/jenkins-resolve-digest.sh" \
+  --build-url "$BUILD_URL" \
+  --expected-version "$VERSION" || exit 1
+IMAGE_DIGEST="$(value_from_output IMAGE_DIGEST "$DIGEST_OUTPUT")"
+DIGEST_BUILD_IDENTITY_VERIFIED="$(value_from_output DIGEST_BUILD_IDENTITY_VERIFIED "$DIGEST_OUTPUT")"
+DIGEST_BUILD_URL="$(value_from_output BUILD_URL "$DIGEST_OUTPUT")"
+[[ -n "$IMAGE_DIGEST" ]] || error_exit "Image digest was not resolved" "Jenkins image digest"
+if [[ "$DIGEST_BUILD_IDENTITY_VERIFIED" != "true" || "${DIGEST_BUILD_URL%/}" != "${BUILD_URL%/}" ]]; then
+  reset_deploy_preconditions
+  gitops_gate_error "digest_build_mismatch" "Image digest does not belong to the completed Jenkins build"
+fi
+DIGEST_BUILD_MATCH=true
+
+case "$(gitops_scope_action)" in
+  ask)
+    save_resume_state "awaiting-gitops-scope" "false"
+    emit_gitops_scope_pause
+    ;;
+  additional_required)
+    save_resume_state "additional_gitops_changes_required" "true"
+    emit_additional_gitops_changes_required
+    ;;
+  proceed)
+    save_resume_state "awaiting-gitops-scope" "true"
+    ;;
+esac
+fi
+
 GITOPS_CHECK_OUTPUT="$WORK_DIR/gitops-check.out"
 run_and_capture "$GITOPS_CHECK_OUTPUT" bash "$SCRIPT_DIR/gitops-check.sh" \
   --project-name "$PROJECT_NAME" \
@@ -889,12 +1498,108 @@ gitops_update_args=(
   --config-template-path "$CONFIG_TEMPLATE_PATH"
   --namespace "$ARGOCD_DESTINATION_NAMESPACE"
   --argocd-app-name "$ARGOCD_APP_NAME"
+  --digest "$IMAGE_DIGEST"
 )
-[[ "$APPROVE_DEPLOYMENT" == "true" ]] && gitops_update_args+=(--approve)
-run_and_capture "$GITOPS_UPDATE_OUTPUT" bash "${gitops_update_args[@]}" || exit 1
-if [[ "$APPROVE_DEPLOYMENT" != "true" ]]; then
+if [[ "$APPROVE_DEPLOYMENT" == "true" || "$NO_EXTRA_GITOPS_CHANGES" == "true" || "$RESUME_GITOPS" == "true" ]]; then
+  gitops_update_args+=(--approve)
+fi
+if ! run_and_capture "$GITOPS_UPDATE_OUTPUT" bash "${gitops_update_args[@]}"; then
+  gitops_child_state="$(value_from_output STATE "$GITOPS_UPDATE_OUTPUT")"
+  CHARTS_UPDATED="$(value_from_output CHARTS_UPDATED "$GITOPS_UPDATE_OUTPUT")"
+  CONFIGS_UPDATED="$(value_from_output CONFIGS_UPDATED "$GITOPS_UPDATE_OUTPUT")"
+  FILES_EXPECTED="$(value_from_output FILES_EXPECTED "$GITOPS_UPDATE_OUTPUT")"
+  FILES_VERIFIED="$(value_from_output FILES_VERIFIED "$GITOPS_UPDATE_OUTPUT")"
+  FILES_FAILED="$(value_from_output FILES_FAILED "$GITOPS_UPDATE_OUTPUT")"
+  VERIFIED_FILES="$(value_from_output VERIFIED_FILES "$GITOPS_UPDATE_OUTPUT")"
+  FAILED_FILES="$(value_from_output FAILED_FILES "$GITOPS_UPDATE_OUTPUT")"
+  EXPECTED_VERSION="$(value_from_output EXPECTED_VERSION "$GITOPS_UPDATE_OUTPUT")"
+  EXPECTED_DIGEST="$(value_from_output EXPECTED_DIGEST "$GITOPS_UPDATE_OUTPUT")"
+  ACTUAL_VERSION="$(value_from_output ACTUAL_VERSION "$GITOPS_UPDATE_OUTPUT")"
+  ACTUAL_DIGEST="$(value_from_output ACTUAL_DIGEST "$GITOPS_UPDATE_OUTPUT")"
+  VERSION_APPLIED="$(value_from_output VERSION_APPLIED "$GITOPS_UPDATE_OUTPUT")"
+  DIGEST_APPLIED="$(value_from_output DIGEST_APPLIED "$GITOPS_UPDATE_OUTPUT")"
+  COMMIT_CREATED="$(value_from_output COMMIT_CREATED "$GITOPS_UPDATE_OUTPUT")"
+  COMMIT_SHA="$(value_from_output COMMIT_SHA "$GITOPS_UPDATE_OUTPUT")"
+  PUSH_COMPLETED="$(value_from_output PUSH_COMPLETED "$GITOPS_UPDATE_OUTPUT")"
+  REMOTE_GIT_VERIFIED="$(value_from_output REMOTE_GIT_VERIFIED "$GITOPS_UPDATE_OUTPUT")"
+  REMOTE_COMMIT_SHA="$(value_from_output REMOTE_COMMIT_SHA "$GITOPS_UPDATE_OUTPUT")"
+  case "$gitops_child_state" in
+    gitops_charts_update_failed|gitops_configs_update_failed|gitops_commit_not_created|gitops_not_updated)
+      gitops_gate_error "gitops_not_updated" "GitOps chart/config update was not completed"
+      ;;
+    gitops_required_file_missing)
+      gitops_gate_error "gitops_required_file_missing" "A required GitOps file is missing"
+      ;;
+    gitops_version_not_applied)
+      gitops_gate_error "gitops_version_not_applied" "GitOps files do not contain the built version and image tag"
+      ;;
+    gitops_digest_not_applied)
+      gitops_gate_error "gitops_digest_not_applied" "GitOps files do not contain the built image digest"
+      ;;
+    gitops_version_mismatch)
+      gitops_gate_error "gitops_version_mismatch" "GitOps files contain a different version or image tag"
+      ;;
+    gitops_digest_mismatch)
+      gitops_gate_error "gitops_digest_mismatch" "GitOps files contain a different image digest"
+      ;;
+    gitops_push_failed)
+      gitops_gate_error "gitops_push_failed" "GitOps push did not complete successfully"
+      ;;
+    git_remote_not_updated)
+      gitops_gate_error "git_remote_not_updated" "Remote Git repository does not contain pushed commit"
+      ;;
+  esac
+  if [[ "$PUSH_COMPLETED" == "false" ]]; then
+    gitops_gate_error "gitops_push_failed" "GitOps push did not complete successfully"
+  fi
+  gitops_gate_error "gitops_update_failed" "GitOps update failed"
+fi
+gitops_status="$(value_from_output STATUS "$GITOPS_UPDATE_OUTPUT")"
+CHARTS_UPDATED="$(value_from_output CHARTS_UPDATED "$GITOPS_UPDATE_OUTPUT")"
+CONFIGS_UPDATED="$(value_from_output CONFIGS_UPDATED "$GITOPS_UPDATE_OUTPUT")"
+FILES_EXPECTED="$(value_from_output FILES_EXPECTED "$GITOPS_UPDATE_OUTPUT")"
+FILES_VERIFIED="$(value_from_output FILES_VERIFIED "$GITOPS_UPDATE_OUTPUT")"
+FILES_FAILED="$(value_from_output FILES_FAILED "$GITOPS_UPDATE_OUTPUT")"
+VERIFIED_FILES="$(value_from_output VERIFIED_FILES "$GITOPS_UPDATE_OUTPUT")"
+FAILED_FILES="$(value_from_output FAILED_FILES "$GITOPS_UPDATE_OUTPUT")"
+EXPECTED_VERSION="$(value_from_output EXPECTED_VERSION "$GITOPS_UPDATE_OUTPUT")"
+EXPECTED_DIGEST="$(value_from_output EXPECTED_DIGEST "$GITOPS_UPDATE_OUTPUT")"
+ACTUAL_VERSION="$(value_from_output ACTUAL_VERSION "$GITOPS_UPDATE_OUTPUT")"
+ACTUAL_DIGEST="$(value_from_output ACTUAL_DIGEST "$GITOPS_UPDATE_OUTPUT")"
+VERSION_APPLIED="$(value_from_output VERSION_APPLIED "$GITOPS_UPDATE_OUTPUT")"
+DIGEST_APPLIED="$(value_from_output DIGEST_APPLIED "$GITOPS_UPDATE_OUTPUT")"
+COMMIT_CREATED="$(value_from_output COMMIT_CREATED "$GITOPS_UPDATE_OUTPUT")"
+COMMIT_SHA="$(value_from_output COMMIT_SHA "$GITOPS_UPDATE_OUTPUT")"
+PUSH_COMPLETED="$(value_from_output PUSH_COMPLETED "$GITOPS_UPDATE_OUTPUT")"
+REMOTE_GIT_VERIFIED="$(value_from_output REMOTE_GIT_VERIFIED "$GITOPS_UPDATE_OUTPUT")"
+REMOTE_COMMIT_SHA="$(value_from_output REMOTE_COMMIT_SHA "$GITOPS_UPDATE_OUTPUT")"
+if [[ "$gitops_status" != "OK" ]]; then
+  gitops_gate_error "gitops_update_failed" "GitOps update failed"
+fi
+if [[ "$CHARTS_UPDATED" != "true" || "$CONFIGS_UPDATED" != "true" || "$COMMIT_CREATED" != "true" ]]; then
+  gitops_gate_error "gitops_not_updated" "GitOps chart/config update was not completed"
+fi
+if [[ "$FILES_FAILED" != "0" || "$FILES_EXPECTED" == "0" || "$FILES_VERIFIED" != "$FILES_EXPECTED" ]]; then
+  gitops_gate_error "gitops_content_not_verified" "GitOps updated files were not fully verified"
+fi
+if [[ "$VERSION_APPLIED" != "true" ]]; then
+  gitops_gate_error "gitops_version_not_applied" "GitOps files do not contain the built version and image tag"
+fi
+if [[ "$DIGEST_APPLIED" != "true" ]]; then
+  gitops_gate_error "gitops_digest_not_applied" "GitOps files do not contain the built image digest"
+fi
+if [[ "$PUSH_COMPLETED" != "true" ]]; then
+  gitops_gate_error "gitops_push_failed" "GitOps push did not complete successfully"
+fi
+if [[ "$REMOTE_GIT_VERIFIED" != "true" || -z "$COMMIT_SHA" || "$COMMIT_SHA" != "$REMOTE_COMMIT_SHA" ]]; then
+  gitops_gate_error "git_remote_not_updated" "Remote Git repository does not contain pushed commit"
+fi
+refresh_argo_deploy_allowed
+if [[ "$APPROVE_DEPLOYMENT" != "true" && "$NO_EXTRA_GITOPS_CHANGES" != "true" && "$RESUME_GITOPS" != "true" ]]; then
   exit 1
 fi
+
+require_argo_deploy_allowed
 
 if [[ -z "$ARGOCD_DESTINATION_SERVER" ]]; then
   error_exit "Missing Argo CD destination server" "Argo CD destination server"
@@ -913,8 +1618,11 @@ argocd_sync_args=(
   --destination-namespace "$ARGOCD_DESTINATION_NAMESPACE"
   --timeout-seconds "$TIMEOUT_SECONDS"
 )
-[[ "$APPROVE_DEPLOYMENT" == "true" ]] && argocd_sync_args+=(--approve)
+if [[ "$APPROVE_DEPLOYMENT" == "true" || "$NO_EXTRA_GITOPS_CHANGES" == "true" || "$RESUME_GITOPS" == "true" ]]; then
+  argocd_sync_args+=(--approve)
+fi
 bash "${argocd_sync_args[@]}"
+remove_resume_state
 
 echo "STATUS=OK"
 echo "ACTION=delivered"
@@ -922,3 +1630,24 @@ echo "PROJECT_NAME=${PROJECT_NAME}"
 echo "ENVIRONMENT=${ENVIRONMENT}"
 echo "DISTRIBUTION_TYPE=${DISTRIBUTION_TYPE}"
 echo "VERSION=${VERSION}"
+echo "IMAGE_DIGEST=${IMAGE_DIGEST}"
+echo "DIGEST_BUILD_MATCH=${DIGEST_BUILD_MATCH}"
+echo "CHARTS_UPDATED=${CHARTS_UPDATED}"
+echo "CONFIGS_UPDATED=${CONFIGS_UPDATED}"
+echo "FILES_EXPECTED=${FILES_EXPECTED}"
+echo "FILES_VERIFIED=${FILES_VERIFIED}"
+echo "FILES_FAILED=${FILES_FAILED}"
+echo "VERIFIED_FILES=${VERIFIED_FILES}"
+echo "FAILED_FILES=${FAILED_FILES}"
+echo "EXPECTED_VERSION=${EXPECTED_VERSION}"
+echo "EXPECTED_DIGEST=${EXPECTED_DIGEST}"
+echo "ACTUAL_VERSION=${ACTUAL_VERSION}"
+echo "ACTUAL_DIGEST=${ACTUAL_DIGEST}"
+echo "VERSION_APPLIED=${VERSION_APPLIED}"
+echo "DIGEST_APPLIED=${DIGEST_APPLIED}"
+echo "COMMIT_CREATED=${COMMIT_CREATED}"
+echo "COMMIT_SHA=${COMMIT_SHA}"
+echo "PUSH_COMPLETED=${PUSH_COMPLETED}"
+echo "REMOTE_GIT_VERIFIED=${REMOTE_GIT_VERIFIED}"
+echo "REMOTE_COMMIT_SHA=${REMOTE_COMMIT_SHA}"
+echo "ARGO_DEPLOY_ALLOWED=${ARGO_DEPLOY_ALLOWED}"

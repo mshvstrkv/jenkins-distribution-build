@@ -6,8 +6,18 @@ The format follows Keep a Changelog, and this skill uses semantic versioning.
 
 ## 1.0.4 - 2026-07-15
 
+### Added
+- Persist deploy pause/resume state after successful Jenkins build and exact digest resolution.
+- Allow GitOps resume without manually re-entering build URL, version, or digest.
+
 ### Changed
 - Forbid agent inference about Jenkins availability, credential validity, DNS, TLS, proxy, firewall, or VPN causes unless those statements come directly from wrapper machine output.
+- Require verified GitOps file contents before Argo deployment.
+- Pause deploy flow before GitOps mutations to ask exactly one additional charts/configs scope question.
+
+### Fixed
+- Verify exact version, image tag, and image digest in changed GitOps files before commit and push.
+- Keep resume state for retry after GitOps failure and remove it only after successful delivery.
 
 ## 1.0.3 - 2026-07-15
 

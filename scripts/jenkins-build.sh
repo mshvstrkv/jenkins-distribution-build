@@ -140,6 +140,12 @@ emit_common() {
   echo "QUEUE_URL=${QUEUE_URL:-}"
   echo "BUILD_URL=${BUILD_URL:-}"
   echo "BUILD_NUMBER=${BUILD_NUMBER:-}"
+  echo "RESOLVED_VERSION=${RESOLVED_VERSION:-}"
+  echo "TRIGGER_VERSION=${TRIGGER_VERSION:-}"
+  echo "ACTUAL_BUILD_BRANCH=${ACTUAL_BUILD_BRANCH:-}"
+  echo "ACTUAL_BUILD_VERSION=${ACTUAL_BUILD_VERSION:-}"
+  echo "ACTUAL_BUILD_DISTRIBUTION_TYPE=${ACTUAL_BUILD_DISTRIBUTION_TYPE:-}"
+  echo "BUILD_PARAMETERS_VERIFIED=${BUILD_PARAMETERS_VERIFIED:-false}"
   echo "RESULT=${RESULT:-}"
   echo "BUILDING=${BUILDING:-}"
   echo "STATUS_VERIFIED=${STATUS_VERIFIED:-false}"
@@ -484,6 +490,33 @@ print(f"API_BUILD_URL={(payload.get('url') or '').rstrip('/')}")
 print(f"API_BUILD_NUMBER={'' if payload.get('number') is None else payload.get('number')}")
 print(f"BUILDING={building_value}")
 print(f"RESULT={result}")
+PY
+}
+
+json_build_parameter_fields() {
+  local json_file="$1"
+  python3 - "$json_file" "$JENKINS_BRANCH_PARAM" "$JENKINS_VERSION_PARAM" "$JENKINS_DISTRIBUTION_TYPE_PARAM" <<'PY'
+import json
+import sys
+
+json_file, branch_name, version_name, distribution_type_name = sys.argv[1:5]
+
+try:
+    with open(json_file, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+except Exception:
+    sys.exit(1)
+
+values = {}
+for action in payload.get("actions") or []:
+    for param in action.get("parameters") or []:
+        name = param.get("name")
+        if name:
+            values[str(name)] = "" if param.get("value") is None else str(param.get("value"))
+
+print(f"ACTUAL_BUILD_BRANCH={values.get(branch_name, '')}")
+print(f"ACTUAL_BUILD_VERSION={values.get(version_name, '')}")
+print(f"ACTUAL_BUILD_DISTRIBUTION_TYPE={values.get(distribution_type_name, '')}")
 PY
 }
 
@@ -1592,6 +1625,29 @@ invalid_queue_url_exit() {
   exit 1
 }
 
+jenkins_version_parameter_not_sent_exit() {
+  STATE="jenkins_version_parameter_not_sent"
+  NEXT_REQUIRED_INPUT="Jenkins VERSION parameter mapping"
+  BUILD_TRIGGERED=false
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Resolved VERSION was not sent to Jenkins trigger"
+  emit_common
+  exit 1
+}
+
+jenkins_build_parameter_mismatch_exit() {
+  STATE="jenkins_build_parameter_mismatch"
+  NEXT_REQUIRED_INPUT="Jenkins build parameter verification"
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Jenkins build parameters do not match requested wrapper parameters"
+  echo "EXPECTED_VERSION=${TRIGGER_VERSION:-${VERSION:-}}"
+  echo "ACTUAL_VERSION=${ACTUAL_BUILD_VERSION:-}"
+  emit_common
+  exit 1
+}
+
 build_wait_timeout_exit() {
   STATE="build_wait_timeout"
   NEXT_REQUIRED_INPUT="${1:-more time or Jenkins build inspection}"
@@ -1600,6 +1656,18 @@ build_wait_timeout_exit() {
   echo "REASON=Timed out waiting for Jenkins build result"
   emit_common
   exit 1
+}
+
+csv_contains() {
+  local csv="$1"
+  local needle="$2"
+  local item
+  local -a items
+  IFS=',' read -r -a items <<<"$csv"
+  for item in "${items[@]}"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
 }
 
 verify_build_identity_chain() {
@@ -1624,6 +1692,32 @@ verify_build_identity_chain() {
   if ! same_jenkins_url_path "$BUILD_URL" "$API_BUILD_URL"; then
     jenkins_build_identity_mismatch_exit
   fi
+}
+
+verify_build_parameters_from_api() {
+  local parameter_fields
+
+  parameter_fields="$(json_build_parameter_fields "$BODY_FILE" || true)"
+  if [[ -z "$parameter_fields" ]]; then
+    BUILD_PARAMETERS_VERIFIED=false
+    jenkins_build_parameter_mismatch_exit
+  fi
+
+  ACTUAL_BUILD_BRANCH="$(sed -n 's/^ACTUAL_BUILD_BRANCH=//p' <<<"$parameter_fields" | tail -n 1)"
+  ACTUAL_BUILD_VERSION="$(sed -n 's/^ACTUAL_BUILD_VERSION=//p' <<<"$parameter_fields" | tail -n 1)"
+  ACTUAL_BUILD_DISTRIBUTION_TYPE="$(sed -n 's/^ACTUAL_BUILD_DISTRIBUTION_TYPE=//p' <<<"$parameter_fields" | tail -n 1)"
+
+  if [[ "$ACTUAL_BUILD_BRANCH" != "$BRANCH" || "$ACTUAL_BUILD_VERSION" != "$TRIGGER_VERSION" ]]; then
+    BUILD_PARAMETERS_VERIFIED=false
+    jenkins_build_parameter_mismatch_exit
+  fi
+
+  if [[ "$DISTRIBUTION_TYPE_PARAMETER_SUPPORTED" == "true" && "$ACTUAL_BUILD_DISTRIBUTION_TYPE" != "$DISTRIBUTION_TYPE" ]]; then
+    BUILD_PARAMETERS_VERIFIED=false
+    jenkins_build_parameter_mismatch_exit
+  fi
+
+  BUILD_PARAMETERS_VERIFIED=true
 }
 
 job_url_for() {
@@ -1956,46 +2050,35 @@ trigger_build() {
   [[ "$JOB_IDENTITY_VERIFIED" == "true" ]] || error_exit "Jenkins job identity must be verified before triggering build" "verified Jenkins job identity"
   [[ "$REQUIRED_PARAMETERS_OK" == "true" ]] || error_exit "Jenkins job parameters must be verified before triggering build" "verified Jenkins job parameters"
 
-  local status encoded_branch encoded_branch_param encoded_version_param encoded_distribution_type_param
-  encoded_branch="$(urlencode "$BRANCH")"
-  encoded_branch_param="$(urlencode "$JENKINS_BRANCH_PARAM")"
-  encoded_version_param="$(urlencode "$JENKINS_VERSION_PARAM")"
-  encoded_distribution_type_param="$(urlencode "$JENKINS_DISTRIBUTION_TYPE_PARAM")"
+  if [[ -z "$VERSION" ]] || ! csv_contains "$SUPPORTED_PARAMETERS" "$JENKINS_VERSION_PARAM"; then
+    jenkins_version_parameter_not_sent_exit
+  fi
+
+  local status
+  RESOLVED_VERSION="$VERSION"
+  TRIGGER_VERSION="$VERSION"
 
   ensure_crumb
 
   local curl_args=(
     --request POST \
     --user "${JENKINS_USER}:${JENKINS_TOKEN}"
+    --data-urlencode "${JENKINS_BRANCH_PARAM}=${BRANCH}"
+    --data-urlencode "${JENKINS_VERSION_PARAM}=${TRIGGER_VERSION}"
   )
   if ((${#CRUMB_HEADER[@]} > 0)); then
     curl_args+=("${CRUMB_HEADER[@]}")
   fi
-  local build_url="${JOB_URL}/buildWithParameters?${encoded_branch_param}=${encoded_branch}"
-  if [[ -n "$VERSION" ]]; then
-    build_url+="&${encoded_version_param}=$(urlencode "$VERSION")"
-  fi
   if [[ -n "$DISTRIBUTION_TYPE" && "$DISTRIBUTION_TYPE_PARAMETER_SUPPORTED" == "true" ]]; then
-    build_url+="&${encoded_distribution_type_param}=$(urlencode "$DISTRIBUTION_TYPE")"
+    curl_args+=(--data-urlencode "${JENKINS_DISTRIBUTION_TYPE_PARAM}=${DISTRIBUTION_TYPE}")
   fi
+  local build_url="${JOB_URL}/buildWithParameters"
   TRIGGER_URL="$build_url"
   jenkins_post_trigger_follow_redirect "$build_url" "${curl_args[@]}"
   status="$TRIGGER_FINAL_STATUS"
 
   if [[ "$status" == "400" || "$status" == "404" || "$status" == "405" ]]; then
-    if [[ -n "$VERSION" || -n "$DISTRIBUTION_TYPE" ]]; then
-      error_exit "Parameterized Jenkins build failed: HTTP ${status}" "Jenkins parameter mapping"
-    fi
-    curl_args=(
-      --request POST \
-      --user "${JENKINS_USER}:${JENKINS_TOKEN}"
-    )
-    if ((${#CRUMB_HEADER[@]} > 0)); then
-      curl_args+=("${CRUMB_HEADER[@]}")
-    fi
-    TRIGGER_URL="${JOB_URL}/build"
-    jenkins_post_trigger_follow_redirect "$TRIGGER_URL" "${curl_args[@]}"
-    status="$TRIGGER_FINAL_STATUS"
+    error_exit "Parameterized Jenkins build failed: HTTP ${status}" "Jenkins parameter mapping"
   fi
 
   case "$status" in
@@ -2069,6 +2152,7 @@ output=""
 headers=""
 method="GET"
 url=""
+data_pairs=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) output="$2"; shift 2 ;;
@@ -2077,6 +2161,7 @@ while [[ $# -gt 0 ]]; do
     --request) method="$2"; shift 2 ;;
     --user) shift 2 ;;
     --header) shift 2 ;;
+    --data-urlencode) data_pairs+=("$2"); shift 2 ;;
     --data-binary) shift 2 ;;
     --silent|--show-error|--fail|--globoff) shift ;;
     *) url="$1"; shift ;;
@@ -2085,28 +2170,49 @@ done
 
 : >"$headers"
 mkdir -p "$(dirname "$output")"
-printf '%s %s\n' "$method" "$url" >>"${JENKINS_BUILD_WAIT_TEST_DIR}/requests.log"
+printf '%s %s %s\n' "$method" "$url" "$(IFS='&'; echo "${data_pairs[*]}")" >>"${JENKINS_BUILD_WAIT_TEST_DIR}/requests.log"
+
+param_value() {
+  local wanted="$1"
+  local pair
+  for pair in "${data_pairs[@]}"; do
+    case "$pair" in
+      "${wanted}="*) printf '%s' "${pair#*=}"; return 0 ;;
+    esac
+  done
+  printf ''
+}
 
 build_json() {
   local number="$1"
   local building="$2"
   local result="$3"
-  local result_json timestamp_part api_url host
+  local result_json timestamp_part api_url host version branch distribution_type distribution_json
   if [[ "$result" == "null" ]]; then
     result_json="null"
   else
     result_json="\"$result\""
   fi
+  branch="develop"
+  version="IFT-0.0.1"
+  distribution_type="ift"
+  if [[ "${JENKINS_BUILD_WAIT_SCENARIO}" == "build-api-default-version" ]]; then
+    version="D-00.000."
+  fi
   timestamp_part=""
   if [[ -n "${4:-}" ]]; then
     timestamp_part=",\"timestamp\":$4"
+  fi
+  distribution_json=',{"name":"DISTRIBUTION_TYPE","value":"'"$distribution_type"'"}'
+  if [[ "${JENKINS_BUILD_WAIT_SCENARIO}" == "no-distribution-type-supported" ]]; then
+    distribution_json=""
   fi
   host="aipay.ci.jenkins.sberbank.ru"
   case "$url" in
     https://ci.jenkins.sberbank.ru/*) host="ci.jenkins.sberbank.ru" ;;
   esac
   api_url="https://${host}/job/aipay/job/SberAiPay_CI/job/test-project-build/${number}/"
-  printf '{"number":%s,"url":"%s","building":%s,"result":%s%s,"artifacts":[]}\n' "$number" "$api_url" "$building" "$result_json" "$timestamp_part"
+  printf '{"number":%s,"url":"%s","building":%s,"result":%s%s,"actions":[{"parameters":[{"name":"BRANCH","value":"%s"},{"name":"VERSION","value":"%s"}%s]}],"artifacts":[]}\n' "$number" "$api_url" "$building" "$result_json" "$timestamp_part" "$branch" "$version" "$distribution_json"
 }
 
 builds_json() {
@@ -2199,6 +2305,19 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/api/json" ]
 fi
 
 if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/config.xml" ]]; then
+  if [[ "$JENKINS_BUILD_WAIT_SCENARIO" == "no-distribution-type-supported" ]]; then
+    cat >"$output" <<'XML'
+<project>
+  <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/test-project.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
+  <properties><hudson.model.ParametersDefinitionProperty><parameterDefinitions>
+    <hudson.model.StringParameterDefinition><name>BRANCH</name><defaultValue>develop</defaultValue></hudson.model.StringParameterDefinition>
+    <hudson.model.StringParameterDefinition><name>VERSION</name><defaultValue>IFT-0.0.1</defaultValue></hudson.model.StringParameterDefinition>
+  </parameterDefinitions></hudson.model.ParametersDefinitionProperty></properties>
+</project>
+XML
+    printf '200'
+    exit 0
+  fi
   cat >"$output" <<'XML'
 <project>
   <scm><userRemoteConfigs><hudson.plugins.git.UserRemoteConfig><url>ssh://git@example.org/team/test-project.git</url></hudson.plugins.git.UserRemoteConfig></userRemoteConfigs></scm>
@@ -2219,10 +2338,13 @@ if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
   [[ -f "$count_file" ]] && count="$(cat "$count_file")"
   count=$((count + 1))
   echo "$count" >"$count_file"
+  param_value VERSION >"${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-post-${count}-version"
+  param_value BRANCH >"${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-post-${count}-branch"
+  param_value DISTRIBUTION_TYPE >"${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-post-${count}-distribution-type"
   case "$JENKINS_BUILD_WAIT_SCENARIO" in
     alias-redirect-then-queue)
       if [[ "$count" == "1" ]]; then
-        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters?BRANCH=develop&VERSION=IFT-0.0.1&DISTRIBUTION_TYPE=ift\r\n' >"$headers"
+        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters\r\n' >"$headers"
         printf '{}\n' >"$output"
         printf '302'
         exit 0
@@ -2234,7 +2356,7 @@ if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
       ;;
     redirect-only-no-queue|recovery-after-ambiguous-trigger)
       if [[ "$count" == "1" ]]; then
-        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters?BRANCH=develop&VERSION=IFT-0.0.1&DISTRIBUTION_TYPE=ift\r\n' >"$headers"
+        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters\r\n' >"$headers"
         printf '{}\n' >"$output"
         printf '302'
         exit 0
@@ -2347,7 +2469,7 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
         printf '200'
       fi
       ;;
-    confirmed-success|alias-redirect-then-queue|recovery-after-ambiguous-trigger|recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
+    confirmed-success|alias-redirect-then-queue|recovery-after-ambiguous-trigger|recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart|no-distribution-type-supported|build-api-default-version)
       build_json 44 false SUCCESS >"$output"
       printf '200'
       ;;
@@ -2561,14 +2683,23 @@ EOF
 
   run_case redirect-success success "RESULT=SUCCESS"
   grep -q "QUEUE_URL=https://aipay.ci.jenkins.sberbank.ru/queue/item/1/" "$tmp/redirect-success/output" || { cat "$tmp/redirect-success/output"; echo "FAIL valid trigger queue URL"; exit 1; }
+  grep -q '^IFT-0.0.1$' "$tmp/redirect-success/trigger-post-1-version" || { cat "$tmp/redirect-success/output"; echo "FAIL no-redirect trigger version"; exit 1; }
   ! grep -q "https://ci.jenkins.sberbank.ru" "$tmp/redirect-success/output" || { cat "$tmp/redirect-success/output"; echo "FAIL redirected Jenkins host emitted"; exit 1; }
   ! grep -q '^GET .*buildWithParameters' "$tmp/redirect-success/requests.log" || { cat "$tmp/redirect-success/requests.log"; echo "FAIL buildWithParameters was polled"; exit 1; }
   ! grep -q '^GET .*/build$' "$tmp/redirect-success/requests.log" || { cat "$tmp/redirect-success/requests.log"; echo "FAIL build endpoint was polled"; exit 1; }
   run_case alias-redirect-then-queue success "RESULT=SUCCESS" 100 2
   grep -q "QUEUE_URL=https://aipay.ci.jenkins.sberbank.ru/queue/item/123/" "$tmp/alias-redirect-then-queue/output" || { cat "$tmp/alias-redirect-then-queue/output"; echo "FAIL alias redirect queue URL"; exit 1; }
+  grep -q '^IFT-0.0.1$' "$tmp/alias-redirect-then-queue/trigger-post-1-version" || { cat "$tmp/alias-redirect-then-queue/output"; echo "FAIL first redirect trigger version"; exit 1; }
+  grep -q '^IFT-0.0.1$' "$tmp/alias-redirect-then-queue/trigger-post-2-version" || { cat "$tmp/alias-redirect-then-queue/output"; echo "FAIL second redirect trigger version"; exit 1; }
+  grep -q "BUILD_PARAMETERS_VERIFIED=true" "$tmp/alias-redirect-then-queue/output" || { cat "$tmp/alias-redirect-then-queue/output"; echo "FAIL build parameters not verified"; exit 1; }
   run_trigger_error_case missing-location "STATE=jenkins_queue_location_unknown" true
   run_trigger_error_case invalid-queue-url "STATE=jenkins_queue_location_unknown"
   run_trigger_error_case redirect-only-no-queue "STATE=jenkins_queue_location_unknown" true 2
+  run_case build-api-default-version failure "STATE=jenkins_build_parameter_mismatch" 100 1
+  grep -q "EXPECTED_VERSION=IFT-0.0.1" "$tmp/build-api-default-version/output" || { cat "$tmp/build-api-default-version/output"; echo "FAIL expected version not reported"; exit 1; }
+  grep -q "ACTUAL_VERSION=D-00.000." "$tmp/build-api-default-version/output" || { cat "$tmp/build-api-default-version/output"; echo "FAIL actual default version not reported"; exit 1; }
+  run_case no-distribution-type-supported success "RESULT=SUCCESS" 100 1
+  [[ ! -s "$tmp/no-distribution-type-supported/trigger-post-1-distribution-type" ]] || { cat "$tmp/no-distribution-type-supported/output"; echo "FAIL unsupported distribution type was sent"; exit 1; }
   run_case confirmed-success success "STATUS_VERIFIED=true"
   run_case redirect-failure success "RESULT=FAILURE"
   run_case transient-404 success "RESULT=SUCCESS"
@@ -2589,6 +2720,11 @@ EOF
   run_case recovery-dtype-mismatch success "RESULT=SUCCESS" 100 1
   run_case recovery-not-found success "RESULT=SUCCESS" 100 1
   run_restart_case
+  echo "TRIGGER_HTTP_REQUEST_COUNT=$(cat "$tmp/alias-redirect-then-queue/trigger-count")"
+  echo "TRIGGER_POST_1_VERSION=$(cat "$tmp/alias-redirect-then-queue/trigger-post-1-version")"
+  echo "TRIGGER_POST_2_VERSION=$(cat "$tmp/alias-redirect-then-queue/trigger-post-2-version")"
+  echo "ACTUAL_BUILD_VERSION=IFT-0.0.1"
+  echo "BUILD_PARAMETERS_VERIFIED=true"
   rm -rf "$tmp"
   echo "JENKINS_BUILD_WAIT_SELF_TESTS=OK"
 }
@@ -2613,6 +2749,7 @@ headers=""
 method="GET"
 url=""
 data_file=""
+data_pairs=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) output="$2"; shift 2 ;;
@@ -2621,6 +2758,7 @@ while [[ $# -gt 0 ]]; do
     --request) method="$2"; shift 2 ;;
     --user) shift 2 ;;
     --header) shift 2 ;;
+    --data-urlencode) data_pairs+=("$2"); shift 2 ;;
     --data-binary) data_file="${2#@}"; shift 2 ;;
     --silent|--show-error|--fail|--globoff) shift ;;
     *) url="$1"; shift ;;
@@ -2630,6 +2768,17 @@ done
 : >"$headers"
 mkdir -p "$(dirname "$output")"
 log="${JENKINS_JOB_CREATE_TEST_DIR}/calls.log"
+
+param_value() {
+  local wanted="$1"
+  local pair
+  for pair in "${data_pairs[@]}"; do
+    case "$pair" in
+      "${wanted}="*) printf '%s' "${pair#*=}"; return 0 ;;
+    esac
+  done
+  printf ''
+}
 
 	template_xml() {
   if [[ "$JENKINS_JOB_CREATE_SCENARIO" == "incompatible-template" ]]; then
@@ -2766,6 +2915,9 @@ fi
 if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
   printf 'buildWithParameters\n' >>"$log"
   printf '%s\n' "$url" >"${JENKINS_JOB_CREATE_TEST_DIR}/trigger-url"
+  printf '%s\n' "$(IFS='&'; echo "${data_pairs[*]}")" >"${JENKINS_JOB_CREATE_TEST_DIR}/trigger-data"
+  param_value VERSION >"${JENKINS_JOB_CREATE_TEST_DIR}/trigger-version"
+  param_value DISTRIBUTION_TYPE >"${JENKINS_JOB_CREATE_TEST_DIR}/trigger-distribution-type"
   count_file="${JENKINS_JOB_CREATE_TEST_DIR}/build-count"
   count=0
   [[ -f "$count_file" ]] && count="$(cat "$count_file")"
@@ -3083,7 +3235,7 @@ EOF
   grep -q "ssh://sc@api.sc-cd.sber.ru:7998/CI00708274/ci00682834_cs-pipeline.git" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL pipeline repository changed"; exit 1; }
   grep -q "<name>2.0</name>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL BranchSpec changed"; exit 1; }
   grep -q "<scriptPath>pipeline/csdo/universal-sbrf-nexus-deploy.groovy</scriptPath>" "$tmp/explicit-job-name/created-config.xml" || { echo "FAIL scriptPath changed"; exit 1; }
-  grep -q "VERSION=IFT-0.0.1" "$tmp/explicit-job-name/trigger-url" || { echo "FAIL trigger did not contain exact version"; exit 1; }
+  grep -q "^IFT-0.0.1$" "$tmp/explicit-job-name/trigger-version" || { echo "FAIL trigger did not contain exact version"; exit 1; }
 
   run_create_case generated-job-name success "CREATED_JOB_NAME=ai-payments-auth-build" \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
@@ -3092,7 +3244,7 @@ EOF
     --job-name ai-payments-auth-build \
     --skip-lookup \
     --repository-url ssh://git@example.org/team/ai-payments-auth.git
-  ! grep -q "DISTRIBUTION_TYPE" "$tmp/no-distribution-type-template/trigger-url" || { echo "FAIL unsupported distribution type parameter sent"; exit 1; }
+  [[ ! -s "$tmp/no-distribution-type-template/trigger-distribution-type" ]] || { echo "FAIL unsupported distribution type parameter sent"; exit 1; }
 
 	  run_create_case canonical-host-alias success "JOB_IDENTITY_VERIFIED=true" \
 	    --jenkins-url https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI \
@@ -3183,8 +3335,8 @@ EOF
 		  grep -q "JOB_EXISTS=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job existence missing"; exit 1; }
 		  grep -q "BUILD_TRIGGERED=true" "$tmp/existing-compatible/output" || { echo "FAIL existing job trigger not reported"; exit 1; }
 		  grep -q "QUEUE_URL=https://aipay.ci.jenkins.sberbank.ru/queue/item/1/" "$tmp/existing-compatible/output" || { echo "FAIL existing job queue URL missing"; exit 1; }
-		  grep -q "VERSION=IFT-0.0.1" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing job trigger exact version"; exit 1; }
-		  ! grep -q "DISTRIBUTION_TYPE" "$tmp/existing-compatible/trigger-url" || { echo "FAIL existing unsupported distribution type sent"; exit 1; }
+		  grep -q "^IFT-0.0.1$" "$tmp/existing-compatible/trigger-version" || { echo "FAIL existing job trigger exact version"; exit 1; }
+		  [[ ! -s "$tmp/existing-compatible/trigger-distribution-type" ]] || { echo "FAIL existing unsupported distribution type sent"; exit 1; }
 
 		  run_existing_success_case existing-job-redirect "JOB_IDENTITY_VERIFIED=true"
 		  grep -q "JOB_URL=https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/ai-payments-auth-build" "$tmp/existing-job-redirect/output" || { echo "FAIL existing job user URL was not preserved"; exit 1; }
@@ -3315,6 +3467,7 @@ wait_for_build() {
         BUILDING="$(sed -n 's/^BUILDING=//p' <<<"$status_fields" | tail -n 1)"
         result="$(sed -n 's/^RESULT=//p' <<<"$status_fields" | tail -n 1)"
         verify_build_identity_chain
+        verify_build_parameters_from_api
         BUILD_NUMBER="$API_BUILD_NUMBER"
         case "$BUILDING:$result" in
           false:SUCCESS|false:FAILURE|false:UNSTABLE|false:ABORTED)
@@ -3413,6 +3566,12 @@ QUEUE_URL=""
 BUILD_URL=""
 QUEUE_EXECUTABLE_URL=""
 BUILD_NUMBER=""
+RESOLVED_VERSION=""
+TRIGGER_VERSION=""
+ACTUAL_BUILD_BRANCH=""
+ACTUAL_BUILD_VERSION=""
+ACTUAL_BUILD_DISTRIBUTION_TYPE=""
+BUILD_PARAMETERS_VERIFIED=false
 RESULT=""
 BUILDING=""
 CURL_GET_STATUS=""
@@ -3651,6 +3810,8 @@ else
     create_job_from_template
   fi
   resolve_version
+  RESOLVED_VERSION="$VERSION"
+  TRIGGER_VERSION="$VERSION"
   emit_version_resolution
   if [[ "$RESOLVE_VERSION_ONLY" == "true" ]]; then
     echo "STATUS=OK"
