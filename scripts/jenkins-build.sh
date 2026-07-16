@@ -1569,6 +1569,18 @@ queue_location_missing_exit() {
   exit 1
 }
 
+queue_location_unknown_exit() {
+  STATE="jenkins_queue_location_unknown"
+  NEXT_REQUIRED_INPUT="check Jenkins queue for matching build"
+  BUILD_TRIGGERED="unknown"
+  QUEUE_URL=""
+  echo "STATUS=ERROR"
+  echo "ACTION=blocked"
+  echo "REASON=Jenkins trigger response did not return a queue item URL"
+  emit_common
+  exit 1
+}
+
 invalid_queue_url_exit() {
   STATE="jenkins_invalid_queue_url"
   NEXT_REQUIRED_INPUT="valid Jenkins queue item URL"
@@ -1819,6 +1831,67 @@ create_job_from_template() {
   verify_created_job_config "$verify_output" "$scan_output" "$compare_output"
 }
 
+TRIGGER_FINAL_STATUS=""
+TRIGGER_FINAL_LOCATION=""
+TRIGGER_FINAL_URL=""
+TRIGGER_AMBIGUOUS=false
+
+jenkins_post_trigger_follow_redirect() {
+  local current_url="$1"
+  shift
+  local redirect_count=0
+  local status location next_url normalized_queue_url
+
+  TRIGGER_FINAL_STATUS=""
+  TRIGGER_FINAL_LOCATION=""
+  TRIGGER_FINAL_URL="$current_url"
+  TRIGGER_AMBIGUOUS=false
+
+  while true; do
+    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "$@" "$current_url")"
+    HTTP_STATUS="$status"
+    TRIGGER_FINAL_STATUS="$status"
+    TRIGGER_FINAL_URL="$current_url"
+
+    case "$status" in
+      301|302|303|307|308)
+        location="$(header_location "$HEADERS_FILE")"
+        if [[ -z "$location" ]]; then
+          TRIGGER_AMBIGUOUS=true
+          return 0
+        fi
+        if normalized_queue_url="$(normalize_queue_url "$current_url" "$location" 2>/dev/null)"; then
+          TRIGGER_FINAL_LOCATION="$normalized_queue_url"
+          return 0
+        fi
+        next_url="$(absolute_url "$current_url" "$location")"
+        if ! approved_jenkins_redirect_url "$next_url"; then
+          TRIGGER_AMBIGUOUS=true
+          return 0
+        fi
+        redirect_count=$((redirect_count + 1))
+        if (( redirect_count > 5 )); then
+          TRIGGER_AMBIGUOUS=true
+          return 0
+        fi
+        current_url="$next_url"
+        ;;
+      201|202)
+        location="$(header_location "$HEADERS_FILE")"
+        if [[ -n "$location" ]] && normalized_queue_url="$(normalize_queue_url "$current_url" "$location" 2>/dev/null)"; then
+          TRIGGER_FINAL_LOCATION="$normalized_queue_url"
+        else
+          TRIGGER_AMBIGUOUS=true
+        fi
+        return 0
+        ;;
+      *)
+        return 0
+        ;;
+    esac
+  done
+}
+
 recover_existing_build() {
   [[ "$DRY_RUN" != "true" ]] || return 1
   [[ -n "$JOB_NAME" && -n "$JOB_URL" && -n "$BRANCH" && -n "$VERSION" ]] || return 1
@@ -1883,7 +1956,7 @@ trigger_build() {
   [[ "$JOB_IDENTITY_VERIFIED" == "true" ]] || error_exit "Jenkins job identity must be verified before triggering build" "verified Jenkins job identity"
   [[ "$REQUIRED_PARAMETERS_OK" == "true" ]] || error_exit "Jenkins job parameters must be verified before triggering build" "verified Jenkins job parameters"
 
-  local status encoded_branch encoded_branch_param encoded_version_param encoded_distribution_type_param location normalized_queue_url
+  local status encoded_branch encoded_branch_param encoded_version_param encoded_distribution_type_param
   encoded_branch="$(urlencode "$BRANCH")"
   encoded_branch_param="$(urlencode "$JENKINS_BRANCH_PARAM")"
   encoded_version_param="$(urlencode "$JENKINS_VERSION_PARAM")"
@@ -1906,8 +1979,8 @@ trigger_build() {
     build_url+="&${encoded_distribution_type_param}=$(urlencode "$DISTRIBUTION_TYPE")"
   fi
   TRIGGER_URL="$build_url"
-  curl_args+=("$build_url")
-  status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
+  jenkins_post_trigger_follow_redirect "$build_url" "${curl_args[@]}"
+  status="$TRIGGER_FINAL_STATUS"
 
   if [[ "$status" == "400" || "$status" == "404" || "$status" == "405" ]]; then
     if [[ -n "$VERSION" || -n "$DISTRIBUTION_TYPE" ]]; then
@@ -1921,22 +1994,25 @@ trigger_build() {
       curl_args+=("${CRUMB_HEADER[@]}")
     fi
     TRIGGER_URL="${JOB_URL}/build"
-    curl_args+=("$TRIGGER_URL")
-    status="$(curl_http "$BODY_FILE" "$HEADERS_FILE" "${curl_args[@]}")"
+    jenkins_post_trigger_follow_redirect "$TRIGGER_URL" "${curl_args[@]}"
+    status="$TRIGGER_FINAL_STATUS"
   fi
 
   case "$status" in
     201|202|302)
-      location="$(header_location "$HEADERS_FILE")"
-      [[ -n "$location" ]] || queue_location_missing_exit
-      if ! normalized_queue_url="$(normalize_queue_url "$TRIGGER_URL" "$location" 2>/dev/null)"; then
-        QUEUE_URL="$location"
-        invalid_queue_url_exit
+      if [[ -n "$TRIGGER_FINAL_LOCATION" ]]; then
+        QUEUE_URL="$TRIGGER_FINAL_LOCATION"
+        BUILD_TRIGGERED=true
+        MUTATIONS_PERFORMED=true
+        ACTION="build"
+        return 0
       fi
-      QUEUE_URL="$normalized_queue_url"
-      BUILD_TRIGGERED=true
       MUTATIONS_PERFORMED=true
-      ACTION="build"
+      if recover_existing_build; then
+        MUTATIONS_PERFORMED=true
+        return 0
+      fi
+      queue_location_unknown_exit
       ;;
     401|403)
       error_exit "Jenkins access denied while triggering build: HTTP ${status}" "valid Jenkins credentials"
@@ -2063,6 +2139,13 @@ if [[ "$url" == *"/queue/api/json?tree="* ]]; then
     recovery-queue)
       printf '{"items":[{"id":1,"url":"https://aipay.ci.jenkins.sberbank.ru/queue/item/1/","task":{"name":"test-project-build","url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/"},"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
       ;;
+    recovery-after-ambiguous-trigger)
+      if [[ -f "${JENKINS_BUILD_WAIT_TEST_DIR}/trigger-count" ]]; then
+        printf '{"items":[{"id":1,"url":"https://aipay.ci.jenkins.sberbank.ru/queue/item/1/","task":{"name":"test-project-build","url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/"},"actions":[{"parameters":[{"name":"BRANCH","value":"develop"},{"name":"VERSION","value":"IFT-0.0.1"},{"name":"DISTRIBUTION_TYPE","value":"ift"}]}]}]}\n' >"$output"
+      else
+        printf '{"items":[]}\n' >"$output"
+      fi
+      ;;
     *)
       printf '{"items":[]}\n' >"$output"
       ;;
@@ -2137,6 +2220,30 @@ if [[ "$method" == "POST" && "$url" == *"/buildWithParameters"* ]]; then
   count=$((count + 1))
   echo "$count" >"$count_file"
   case "$JENKINS_BUILD_WAIT_SCENARIO" in
+    alias-redirect-then-queue)
+      if [[ "$count" == "1" ]]; then
+        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters?BRANCH=develop&VERSION=IFT-0.0.1&DISTRIBUTION_TYPE=ift\r\n' >"$headers"
+        printf '{}\n' >"$output"
+        printf '302'
+        exit 0
+      fi
+      printf 'Location: https://aipay.ci.jenkins.sberbank.ru/queue/item/123/\r\n' >"$headers"
+      printf '{}\n' >"$output"
+      printf '201'
+      exit 0
+      ;;
+    redirect-only-no-queue|recovery-after-ambiguous-trigger)
+      if [[ "$count" == "1" ]]; then
+        printf 'Location: https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/buildWithParameters?BRANCH=develop&VERSION=IFT-0.0.1&DISTRIBUTION_TYPE=ift\r\n' >"$headers"
+        printf '{}\n' >"$output"
+        printf '302'
+        exit 0
+      fi
+      : >"$headers"
+      printf '{}\n' >"$output"
+      printf '201'
+      exit 0
+      ;;
     missing-location)
       : >"$headers"
       ;;
@@ -2158,6 +2265,12 @@ if [[ "$url" == *"/queue/item/1/api/json" ]]; then
     printf '200'
     exit 0
   fi
+  printf '{"executable":{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/"}}\n' >"$output"
+  printf '200'
+  exit 0
+fi
+
+if [[ "$url" == *"/queue/item/123/api/json" ]]; then
   printf '{"executable":{"url":"https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-project-build/44/"}}\n' >"$output"
   printf '200'
   exit 0
@@ -2234,7 +2347,7 @@ if [[ "$url" == *"/job/aipay/job/SberAiPay_CI/job/test-project-build/44/api/json
         printf '200'
       fi
       ;;
-    confirmed-success|recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
+    confirmed-success|alias-redirect-then-queue|recovery-after-ambiguous-trigger|recovery-recent-success|recovery-old-success|recovery-not-found|recovery-aborted|recovery-dtype-mismatch|repeated-restart)
       build_json 44 false SUCCESS >"$output"
       printf '200'
       ;;
@@ -2345,6 +2458,7 @@ EOF
     local scenario="$1"
     local expected_pattern="$2"
     local expect_empty_queue="${3:-false}"
+    local expected_trigger_count="${4:-1}"
     local case_dir output rc trigger_count build_count
     case_dir="$tmp/$scenario"
     mkdir -p "$case_dir"
@@ -2377,7 +2491,10 @@ EOF
       grep -q "^QUEUE_URL=$" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} queue URL not empty"; exit 1; }
     fi
     trigger_count="$(cat "$case_dir/trigger-count" 2>/dev/null || echo 0)"
-    [[ "$trigger_count" == "1" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} trigger count ${trigger_count}"; exit 1; }
+    [[ "$trigger_count" == "$expected_trigger_count" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} trigger count ${trigger_count}"; exit 1; }
+    if [[ "$expected_pattern" == *"jenkins_queue_location_unknown"* ]]; then
+      grep -q "MUTATIONS_PERFORMED=true" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL ${scenario} mutation not reported"; exit 1; }
+    fi
     build_count="$(cat "$case_dir/build-count" 2>/dev/null || echo 0)"
     [[ "$build_count" == "0" ]] || { printf '%s\n' "$output"; echo "FAIL ${scenario} build polling count ${build_count}"; exit 1; }
     ! grep -q '^GET .*buildWithParameters' "$case_dir/requests.log" || { cat "$case_dir/requests.log"; echo "FAIL ${scenario} polled buildWithParameters"; exit 1; }
@@ -2447,8 +2564,11 @@ EOF
   ! grep -q "https://ci.jenkins.sberbank.ru" "$tmp/redirect-success/output" || { cat "$tmp/redirect-success/output"; echo "FAIL redirected Jenkins host emitted"; exit 1; }
   ! grep -q '^GET .*buildWithParameters' "$tmp/redirect-success/requests.log" || { cat "$tmp/redirect-success/requests.log"; echo "FAIL buildWithParameters was polled"; exit 1; }
   ! grep -q '^GET .*/build$' "$tmp/redirect-success/requests.log" || { cat "$tmp/redirect-success/requests.log"; echo "FAIL build endpoint was polled"; exit 1; }
-  run_trigger_error_case missing-location "STATE=jenkins_queue_location_missing" true
-  run_trigger_error_case invalid-queue-url "STATE=jenkins_invalid_queue_url"
+  run_case alias-redirect-then-queue success "RESULT=SUCCESS" 100 2
+  grep -q "QUEUE_URL=https://aipay.ci.jenkins.sberbank.ru/queue/item/123/" "$tmp/alias-redirect-then-queue/output" || { cat "$tmp/alias-redirect-then-queue/output"; echo "FAIL alias redirect queue URL"; exit 1; }
+  run_trigger_error_case missing-location "STATE=jenkins_queue_location_unknown" true
+  run_trigger_error_case invalid-queue-url "STATE=jenkins_queue_location_unknown"
+  run_trigger_error_case redirect-only-no-queue "STATE=jenkins_queue_location_unknown" true 2
   run_case confirmed-success success "STATUS_VERIFIED=true"
   run_case redirect-failure success "RESULT=FAILURE"
   run_case transient-404 success "RESULT=SUCCESS"
@@ -2459,6 +2579,7 @@ EOF
   run_case inconsistent-success success "STATUS_VERIFIED=true" 100 1 2
   run_case stale-body-curl-failure failure "STATE=jenkins_build_status_unavailable" 100 1
   run_case recovery-queue success "ACTION=recovered" 100 0
+  run_case recovery-after-ambiguous-trigger success "ACTION=recovered" 100 2
   run_case recovery-running success "ACTION=recovered" 100 0
   run_case recovery-recent-success success "ACTION=recovered" 100 0
   run_case recovery-old-success success "RESULT=SUCCESS" 100 1

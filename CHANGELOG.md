@@ -11,6 +11,11 @@ The format follows Keep a Changelog, and this skill uses semantic versioning.
 
 ## 1.0.3 - 2026-07-15
 
+### Fixed
+- Follow approved Jenkins alias redirects during trigger POST without treating intermediate `buildWithParameters` redirects as queue URLs.
+- Recover matching Jenkins queue/build state after ambiguous trigger responses to avoid duplicate build creation.
+- Return `jenkins_queue_location_unknown` when a possible trigger lacks a final queue item `Location`.
+
 ### Changed
 - Removed environment classification language from agent policy.
 - Required wrapper errors to be reported without agent-added network explanations.
