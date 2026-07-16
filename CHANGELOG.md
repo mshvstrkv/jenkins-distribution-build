@@ -18,6 +18,10 @@ The format follows Keep a Changelog, and this skill uses semantic versioning.
 
 ## 1.0.2 - 2026-07-15
 
+### Fixed
+- Made Jenkins failure analyzer temporary console log creation portable on macOS and Linux.
+- Added analyzer self-tests for unique temp files, empty consoleText, and mktemp failure.
+
 ### Changed
 - Simplified Jenkins job URL handling so only configured-host `JOB_URL` is emitted.
 - Kept Jenkins API redirects internal to HTTP helpers without exposing redirected hosts in machine output.

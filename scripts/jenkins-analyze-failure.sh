@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-ENV_FILE="${SKILL_ROOT}/.env"
+ENV_FILE="${ENV_FILE:-${SKILL_ROOT}/.env}"
 
 load_skill_env() {
   [[ -f "$ENV_FILE" ]] || return 0
@@ -51,10 +51,146 @@ error_exit() {
   exit 1
 }
 
+temp_file_error() {
+  echo "STATUS=ERROR"
+  echo "FAILURE_CATEGORY=wrapper"
+  echo "FAILURE_SUMMARY=Failed to create temporary console log file"
+  echo "LOG_FILE="
+  echo "SUGGESTED_ACTION=check temporary directory access"
+  exit 1
+}
+
 require_value() {
   local option="$1"
   local value="${2:-}"
   [[ -n "$value" ]] || error_exit "Missing value for ${option}" "${option}"
+}
+
+create_temp_file() {
+  local prefix="$1"
+  local temp_root="${TMPDIR:-/tmp}"
+  mktemp "${temp_root%/}/${prefix}.XXXXXX" 2>/dev/null || mktemp -t "$prefix" 2>/dev/null
+}
+
+create_temp_log() {
+  create_temp_file "jenkins-console"
+}
+
+sanitize_error() {
+  local file="$1"
+  tr '\n' ' ' <"$file" | sed 's/[[:space:]]\+/ /g'
+}
+
+url_host() {
+  python3 - "$1" <<'PY'
+import sys
+import urllib.parse
+
+print(urllib.parse.urlparse(sys.argv[1]).hostname or "")
+PY
+}
+
+resolve_location() {
+  python3 - "$1" "$2" <<'PY'
+import sys
+import urllib.parse
+
+print(urllib.parse.urljoin(sys.argv[1], sys.argv[2]))
+PY
+}
+
+is_approved_jenkins_host() {
+  case "$(url_host "$1")" in
+    aipay.ci.jenkins.sberbank.ru|ci.jenkins.sberbank.ru)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+header_value() {
+  local header_file="$1"
+  local header_name="$2"
+  awk -v name="$header_name" '
+    BEGIN { IGNORECASE = 1 }
+    index($0, name ":") == 1 {
+      sub(/\r$/, "")
+      sub("^[^:]+:[[:space:]]*", "")
+      print
+      exit
+    }
+  ' "$header_file"
+}
+
+download_console_text() {
+  local url="$1"
+  local output_file="$2"
+  local header_file="$3"
+  local error_file="$4"
+  local current_url="$url"
+  local redirects=0
+  local http_status
+
+  while :; do
+    : >"$output_file"
+    : >"$header_file"
+    : >"$error_file"
+
+    set +e
+    http_status="$(
+      curl --silent --show-error --globoff \
+        --user "${JENKINS_USER}:${JENKINS_TOKEN}" \
+        --dump-header "$header_file" \
+        --output "$output_file" \
+        --write-out "%{http_code}" \
+        "$current_url" 2>"$error_file"
+    )"
+    local curl_rc=$?
+    set -e
+
+    if [[ $curl_rc -ne 0 ]]; then
+      CURL_HTTP_STATUS="${http_status:-000}"
+      CURL_ERROR="$(sanitize_error "$error_file")"
+      return 1
+    fi
+
+    case "$http_status" in
+      301|302|303|307|308)
+        redirects=$((redirects + 1))
+        if (( redirects > 5 )); then
+          CURL_HTTP_STATUS="$http_status"
+          CURL_ERROR="Jenkins redirect limit exceeded"
+          return 1
+        fi
+        local location
+        location="$(header_value "$header_file" "Location")"
+        if [[ -z "$location" ]]; then
+          CURL_HTTP_STATUS="$http_status"
+          CURL_ERROR="Jenkins redirect response did not include Location"
+          return 1
+        fi
+        current_url="$(resolve_location "$current_url" "$location")"
+        if ! is_approved_jenkins_host "$current_url"; then
+          CURL_HTTP_STATUS="$http_status"
+          CURL_ERROR="Jenkins redirect target is not approved"
+          return 1
+        fi
+        continue
+        ;;
+      200)
+        CURL_HTTP_STATUS="$http_status"
+        CURL_ERROR=""
+        return 0
+        ;;
+      *)
+        CURL_HTTP_STATUS="$http_status"
+        CURL_ERROR=""
+        return 1
+        ;;
+    esac
+  done
 }
 
 analyze_log() {
@@ -113,6 +249,125 @@ print(f"SUGGESTED_ACTION={action}")
 PY
 }
 
+run_self_tests() {
+  local tmp bin mock_curl mock_mktemp log1 log2 output rc old_file
+  tmp="$(mktemp -d)"
+  bin="$tmp/bin"
+  mkdir -p "$bin" "$tmp/var/folders/s9/test/T"
+  mock_curl="$bin/curl"
+  mock_mktemp="$bin/mktemp"
+  old_file="$tmp/var/folders/s9/test/T/jenkins-console.ABCDEF"
+  printf 'old log\n' >"$old_file"
+  trap 'rm -rf "$tmp"' RETURN
+
+  cat >"$mock_curl" <<'EOF'
+#!/usr/bin/env bash
+output=""
+headers=""
+url=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --output) output="$2"; shift 2 ;;
+    --dump-header) headers="$2"; shift 2 ;;
+    --write-out) shift 2 ;;
+    --user) shift 2 ;;
+    --silent|--show-error|--globoff) shift ;;
+    *) url="$1"; shift ;;
+  esac
+done
+
+: >"$headers"
+mkdir -p "$(dirname "$output")"
+case "${JENKINS_ANALYZE_FAILURE_TEST_SCENARIO:-success}" in
+  empty)
+    : >"$output"
+    printf '200'
+    exit 0
+    ;;
+  success)
+    if [[ "$url" == https://aipay.ci.jenkins.sberbank.ru/* ]]; then
+      printf 'Location: https://ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-build/1/consoleText\r\n' >"$headers"
+      : >"$output"
+      printf '302'
+      exit 0
+    fi
+    cat >"$output" <<'LOG'
+[INFO] Build started
+[ERROR] COMPILATION ERROR
+[ERROR] cannot find symbol
+LOG
+    printf '200'
+    exit 0
+    ;;
+esac
+
+printf 'unexpected scenario' >&2
+printf '500'
+exit 0
+EOF
+
+  chmod +x "$mock_curl"
+
+  run_success() {
+    PATH="$bin:$PATH" \
+    ENV_FILE=/tmp/nonexistent-jenkins-skill-env \
+    TMPDIR="$tmp/var/folders/s9/test/T/" \
+    JENKINS_USER=dummy \
+    JENKINS_TOKEN=dummy \
+    JENKINS_ANALYZE_FAILURE_TEST_SCENARIO=success \
+    bash "$0" --build-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-build/1" --max-lines 20
+  }
+
+  output="$(run_success)"
+  grep -q "STATUS=ERROR" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL success status"; exit 1; }
+  grep -q "FAILURE_CATEGORY=compilation" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL compilation category"; exit 1; }
+  log1="$(sed -n 's/^LOG_FILE=//p' <<<"$output" | tail -n 1)"
+  [[ -n "$log1" && -s "$log1" ]] || { printf '%s\n' "$output"; echo "FAIL log file missing"; exit 1; }
+  [[ "$log1" != *.log ]] || { printf '%s\n' "$output"; echo "FAIL log file suffix"; exit 1; }
+
+  output="$(run_success)"
+  log2="$(sed -n 's/^LOG_FILE=//p' <<<"$output" | tail -n 1)"
+  [[ -n "$log2" && -s "$log2" ]] || { printf '%s\n' "$output"; echo "FAIL second log file missing"; exit 1; }
+  [[ "$log1" != "$log2" ]] || { echo "FAIL log files are not unique"; exit 1; }
+  [[ -f "$old_file" ]] || { echo "FAIL old temp file removed"; exit 1; }
+
+  set +e
+  output="$(
+    PATH="$bin:$PATH" \
+    ENV_FILE=/tmp/nonexistent-jenkins-skill-env \
+    TMPDIR="$tmp/var/folders/s9/test/T/" \
+    JENKINS_USER=dummy \
+    JENKINS_TOKEN=dummy \
+    JENKINS_ANALYZE_FAILURE_TEST_SCENARIO=empty \
+    bash "$0" --build-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-build/1"
+  )"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { printf '%s\n' "$output"; echo "FAIL empty console accepted"; exit 1; }
+  grep -q "FAILURE_SUMMARY=Jenkins console log is empty" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL empty console summary"; exit 1; }
+
+  cat >"$mock_mktemp" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+  chmod +x "$mock_mktemp"
+  set +e
+  output="$(
+    PATH="$bin:$PATH" \
+    ENV_FILE=/tmp/nonexistent-jenkins-skill-env \
+    TMPDIR="$tmp/var/folders/s9/test/T/" \
+    JENKINS_USER=dummy \
+    JENKINS_TOKEN=dummy \
+    bash "$0" --build-url "https://aipay.ci.jenkins.sberbank.ru/job/aipay/job/SberAiPay_CI/job/test-build/1"
+  )"
+  rc=$?
+  set -e
+  [[ $rc -ne 0 ]] || { printf '%s\n' "$output"; echo "FAIL mktemp failure accepted"; exit 1; }
+  grep -q "FAILURE_SUMMARY=Failed to create temporary console log file" <<<"$output" || { printf '%s\n' "$output"; echo "FAIL mktemp failure summary"; exit 1; }
+
+  echo "JENKINS_ANALYZE_FAILURE_SELF_TESTS=OK"
+}
+
 BUILD_URL=""
 MAX_LINES=400
 
@@ -132,6 +387,10 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
+    --self-test)
+      run_self_tests
+      exit 0
+      ;;
     *)
       error_exit "Unknown argument: $1" "$1"
       ;;
@@ -145,16 +404,28 @@ done
 command -v curl >/dev/null 2>&1 || error_exit "curl is required but was not found" "curl"
 command -v python3 >/dev/null 2>&1 || error_exit "python3 is required but was not found" "python3"
 
-LOG_FILE="$(mktemp "${TMPDIR:-/tmp}/jenkins-console.XXXXXX.log")"
-ERROR_FILE="$(mktemp "${TMPDIR:-/tmp}/jenkins-console-curl.XXXXXX.err")"
+LOG_FILE="$(create_temp_log)" || temp_file_error
+HEADER_FILE="$(create_temp_file "jenkins-console-headers")" || temp_file_error
+ERROR_FILE="$(create_temp_file "jenkins-console-curl")" || temp_file_error
 
-if ! curl --silent --show-error --fail --user "${JENKINS_USER}:${JENKINS_TOKEN}" --output "$LOG_FILE" "${BUILD_URL%/}/consoleText" 2>"$ERROR_FILE"; then
-  message="$(tr '\n' ' ' <"$ERROR_FILE" | sed 's/[[:space:]]\+/ /g')"
-  rm -f "$ERROR_FILE"
-  error_exit "Failed to download Jenkins console log: ${message}" "Jenkins access"
+if ! download_console_text "${BUILD_URL%/}/consoleText" "$LOG_FILE" "$HEADER_FILE" "$ERROR_FILE"; then
+  rm -f "$HEADER_FILE" "$ERROR_FILE"
+  if [[ -n "${CURL_ERROR:-}" ]]; then
+    error_exit "Failed to download Jenkins console log: ${CURL_ERROR}" "Jenkins console access"
+  fi
+  error_exit "Failed to download Jenkins console log: HTTP ${CURL_HTTP_STATUS:-}" "Jenkins console access"
 fi
 
-rm -f "$ERROR_FILE"
+rm -f "$HEADER_FILE" "$ERROR_FILE"
+
+if [[ ! -s "$LOG_FILE" ]]; then
+  echo "STATUS=ERROR"
+  echo "FAILURE_CATEGORY=wrapper"
+  echo "FAILURE_SUMMARY=Jenkins console log is empty"
+  echo "LOG_FILE=${LOG_FILE}"
+  echo "SUGGESTED_ACTION=check Jenkins consoleText access"
+  exit 1
+fi
 
 echo "STATUS=ERROR"
 analyze_log "$LOG_FILE" "$MAX_LINES"
